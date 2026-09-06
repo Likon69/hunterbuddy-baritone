@@ -1,0 +1,57 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read build config
+        id: cfg
+        run: |
+          mc=$(grep '^minecraft_version=' gradle.properties | cut -d= -f2)
+          version=${GITHUB_REF_NAME#v}
+          {
+            echo "java=$(grep '^java_version=' gradle.properties | cut -d= -f2)"
+            echo "mc=$mc"
+            echo "version=$version"
+            echo "modver=${version%-$mc}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK ${{ steps.cfg.outputs.java }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ steps.cfg.outputs.java }}
+          distribution: 'zulu'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        run: >
+          ./gradlew build
+          -Pmod_version=${{ steps.cfg.outputs.version }}
+          -Porg.gradle.java.installations.auto-detect=false
+          "-Porg.gradle.java.installations.paths=$JAVA_HOME"
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Baritone ${{ steps.cfg.outputs.modver }} for Minecraft ${{ steps.cfg.outputs.mc }}
+          files: dist/*
+          fail_on_unmatched_files: true
