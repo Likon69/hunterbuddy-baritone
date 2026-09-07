@@ -32,8 +32,12 @@ import baritone.utils.IRenderer;
 import baritone.utils.PathRenderer;
 import baritone.utils.accessor.IFireworkRocketEntity;
 import com.mojang.blaze3d.vertex.BufferBuilder;
+import dev.babbaj.pathfinder.PathSegment;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.floats.FloatIterator;
+import it.unimi.dsi.fastutil.longs.LongCollection;
+import it.unimi.dsi.fastutil.longs.LongIterator;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.NonNullList;
 import net.minecraft.core.component.DataComponents;
@@ -63,6 +67,7 @@ import java.util.*;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.*;
+import java.util.function.Function;
 import java.util.function.UnaryOperator;
 
 import static baritone.utils.BaritoneMath.fastCeil;
@@ -81,6 +86,28 @@ public final class ElytraBehavior implements Helper {
 
     // :sunglasses:
     public final NetherPathfinderContext context;
+    /**
+     * A second native context holding the same chunks as {@link #context}, except that every chunk outside the
+     * corridor another mod pushed through {@link ElytraProcess#setPathCorridor} is inserted as solid, so a search
+     * in it cannot leave the corridor. Only the path search uses it; the raytraces, {@link #passable} and
+     * {@link NetherPathfinderContext#hasChunk} stay on {@link #context}, which knows the real terrain. Built
+     * with the behavior if a corridor is set at that moment and {@code null} otherwise, so a corridor pushed
+     * after that only takes effect from the next destination on.
+     */
+    final NetherPathfinderContext corridorContext;
+    /**
+     * The chunks currently inserted as solid in {@link #corridorContext} for being outside the corridor, so the
+     * ring mask does not re-insert 32 KiB of solid for the same chunk every time it runs. Game thread only. Kept
+     * honest by every path that changes a chunk's state in that context: a chunk that flips into the corridor
+     * or gets admitted around a search start leaves the set, and a cull drops the far keys the native side has
+     * just forgotten.
+     */
+    private final LongOpenHashSet maskedKeys = new LongOpenHashSet();
+    /**
+     * The player's chunk the last time the ring mask ran, so that it runs again as soon as the player has moved
+     * to another chunk rather than only when the corridor is pushed.
+     */
+    private long lastRingCenter = ChunkPos.INVALID_CHUNK_POS;
     public final PathManager pathManager;
     private final ElytraProcess process;
 
@@ -138,6 +165,11 @@ public final class ElytraBehavior implements Helper {
 
         this.context = new NetherPathfinderContext(Baritone.settings().elytraNetherSeed.value);
         this.boi = new BlockStateOctreeInterface(context);
+        // Same seed as the main context: with elytraPredictTerrain on, a chunk the client has not received is
+        // generated from it, and the two contexts must not disagree about what is there.
+        this.corridorContext = process.hasCorridor() && Baritone.settings().elytraCorridor.value
+                ? new NetherPathfinderContext(Baritone.settings().elytraNetherSeed.value)
+                : null;
     }
 
     public final class PathManager {
@@ -366,10 +398,101 @@ public final class ElytraBehavior implements Helper {
 
         // mickey resigned
         private CompletableFuture<Void> path0(BlockPos src, BlockPos dst, UnaryOperator<UnpackedSegment> operator) {
-            return ElytraBehavior.this.context.pathFindAsync(src, dst)
+            return this.search(src, dst)
                     .thenApply(UnpackedSegment::from)
                     .thenApply(operator)
                     .thenAcceptAsync(this::setPath, ctx.minecraft()::execute);
+        }
+
+        /**
+         * The search behind every path computation: inside the corridor first when one is set, on the full map
+         * otherwise or when the corridor has no way through. Called on the game thread (every caller is a tick or
+         * a takeoff state), which {@link #corridorAdmit} relies on; the continuations run on the native contexts'
+         * executors and touch nothing but the segments and the log.
+         * <p>
+         * A failure has to reach the callers' {@code whenComplete} handlers the way a plain {@code pathFindAsync}
+         * failure does, as a {@link CompletionException} whose cause is a {@link PathCalculationException}: that
+         * is what they test for, and anything else gets reported as an unhandled exception.
+         */
+        private CompletableFuture<PathSegment> search(final BlockPos src, final BlockPos dst) {
+            final boolean x4 = Baritone.settings().elytraPathNodeSize.value >= 4;
+            final boolean adaptive = Baritone.settings().elytraPathNodeAdaptive.value;
+            final NetherPathfinderContext corridor = ElytraBehavior.this.corridorContext;
+            if (corridor == null || !process.hasCorridor() || !Baritone.settings().elytraCorridor.value) {
+                return this.searchIn(ElytraBehavior.this.context, "full map", src, dst, x4, adaptive);
+            }
+            ElytraBehavior.this.corridorAdmit(src);
+            // handle() sees both outcomes of the corridor search and nothing else. An exceptionallyCompose chained
+            // after a thenCompose fallback would also catch the fallback's own failure and run it a second time.
+            return this.searchIn(corridor, "corridor", src, dst, x4, adaptive)
+                    .handle((segment, ex) -> {
+                        if (ex == null && !isStub(src, segment)) {
+                            return CompletableFuture.completedFuture(segment);
+                        }
+                        final Throwable cause = ex == null ? null : unwrap(ex);
+                        if (ex != null && !(cause instanceof PathCalculationException)) {
+                            return CompletableFuture.<PathSegment>failedFuture(cause);
+                        }
+                        logVerbose("corridor: no path ("
+                                + (ex == null ? "stub, " + segment.packed.length + " nodes" : cause.getMessage())
+                                + "), falling back to the full map");
+                        return this.searchIn(ElytraBehavior.this.context, "full map", src, dst, x4, adaptive);
+                    })
+                    .thenCompose(Function.identity());
+        }
+
+        /**
+         * One search in one context: with wide nodes first if asked, and when that comes back a stub and the
+         * adaptive setting is on, the same search again with fine nodes. A stub from the fine search is returned
+         * as it is; whether that means trying another context or flying it is the caller's business.
+         */
+        private CompletableFuture<PathSegment> searchIn(final NetherPathfinderContext where, final String label,
+                                                       final BlockPos src, final BlockPos dst,
+                                                       final boolean x4, final boolean adaptive) {
+            return where.pathFindAsync(src, dst, x4)
+                    .thenCompose(segment -> {
+                        logVerbose(String.format("path: %s x%d (finished=%b, %d nodes)", label, x4 ? 4 : 2, segment.finished, segment.packed.length));
+                        if (x4 && adaptive && isStub(src, segment)) {
+                            return where.pathFindAsync(src, dst, false)
+                                    .thenApply(fine -> {
+                                        logVerbose(String.format("path: %s x2 (finished=%b, %d nodes)", label, fine.finished, fine.packed.length));
+                                        return fine;
+                                    });
+                        }
+                        return CompletableFuture.completedFuture(segment);
+                    });
+        }
+
+        /**
+         * An unfinished segment whose last node is still within 64 blocks (horizontally) of where it started.
+         * The native search does not return null for "no way through": when its open set runs dry or the timeout
+         * hits, it hands back the best node it reached, unfinished. Near the start that means it was boxed in,
+         * which is worth retrying with finer nodes or on the full map. Far from the start it is a segment worth
+         * flying: the destination normally sits hundreds of blocks past the loaded edge, so every search ends
+         * unfinished at the fake-chunk cutoff, and calling those failures would leave nothing to fly at all.
+         */
+        private static boolean isStub(final BlockPos src, final PathSegment segment) {
+            if (segment.finished) {
+                return false;
+            }
+            if (segment.packed.length == 0) {
+                return true;
+            }
+            final BetterBlockPos last = BetterBlockPos.deserializeFromLong(segment.packed[segment.packed.length - 1]);
+            final double dx = last.x - src.getX();
+            final double dz = last.z - src.getZ();
+            return dx * dx + dz * dz < 64 * 64;
+        }
+
+        /**
+         * The exception a stage actually failed with, out of the {@link CompletionException}s that chaining wraps
+         * it in (once per stage it crossed).
+         */
+        private static Throwable unwrap(Throwable ex) {
+            while (ex instanceof CompletionException && ex.getCause() != null) {
+                ex = ex.getCause();
+            }
+            return ex;
         }
 
         private void pathfindAroundObstacles() {
@@ -580,6 +703,7 @@ public final class ElytraBehavior implements Helper {
             final LevelChunk chunk = ctx.world().getChunkSource().getChunk(event.getX(), event.getZ(), false);
             if (chunk != null && !chunk.isEmpty()) {
                 this.context.queueForPacking(chunk);
+                this.feedCorridor(chunk);
             }
         }
     }
@@ -618,6 +742,7 @@ public final class ElytraBehavior implements Helper {
                 final LevelChunk chunk = chunkSource.getChunk(centerX + dx, centerZ + dz, false);
                 if (chunk != null && !chunk.isEmpty()) {
                     this.context.queueForPacking(chunk);
+                    this.feedCorridor(chunk);
                     packed++;
                 }
             }
@@ -627,6 +752,120 @@ public final class ElytraBehavior implements Helper {
 
     public void onBlockChange(BlockChangeEvent event) {
         this.context.queueBlockUpdate(event);
+        // Only for a chunk inside the corridor: a masked chunk is solid on purpose, and applying a block update
+        // to it would carve real air into the wall.
+        if (this.corridorContext != null && process.corridorContains(event.getChunkPos().toLong())) {
+            this.corridorContext.queueBlockUpdate(event);
+        }
+    }
+
+    /**
+     * Mirrors a chunk that was just packed into {@link #context} into {@link #corridorContext}: as real terrain
+     * if it is inside the corridor, as a solid block if it is not. Called from every place the main context is
+     * given a chunk, so the two contexts never disagree about which chunks exist, only about what is in them.
+     */
+    private void feedCorridor(final LevelChunk chunk) {
+        if (this.corridorContext == null) {
+            return;
+        }
+        final ChunkPos pos = chunk.getPos();
+        final long key = pos.toLong();
+        if (process.corridorContains(key)) {
+            this.maskedKeys.remove(key);
+            this.corridorContext.queueForPacking(chunk, true);
+        } else {
+            this.maskedKeys.add(key);
+            this.corridorContext.queueSolid(pos.x, pos.z);
+        }
+    }
+
+    /**
+     * Applies a corridor change to {@link #corridorContext}. {@code flipped} holds the chunks whose membership
+     * changed: the ones now inside get their real terrain back, or air when the client does not have them (which
+     * is what a chunk the pathfinder was never given counts as anyway); the ones now outside are masked solid.
+     * Then the ring mask runs, see {@link #ringMask}. Game thread only: it reads loaded chunks and
+     * {@link #maskedKeys}. Public only because {@link ElytraProcess} is in another package, like the other
+     * members it reaches into here.
+     */
+    public void corridorRefresh(final LongCollection flipped) {
+        if (this.corridorContext == null || ctx.world() == null || ctx.player() == null) {
+            return;
+        }
+        if (!process.hasCorridor()) {
+            // The corridor was cleared. Nothing searches this context until a new destination builds a new
+            // behavior, so masking and unmasking hundreds of chunks for it would be work for nothing.
+            return;
+        }
+        final ChunkSource chunkSource = ctx.world().getChunkSource();
+        final LongIterator it = flipped.iterator();
+        while (it.hasNext()) {
+            final long key = it.nextLong();
+            final int x = ChunkPos.getX(key);
+            final int z = ChunkPos.getZ(key);
+            if (process.corridorContains(key)) {
+                this.maskedKeys.remove(key);
+                final LevelChunk chunk = chunkSource.getChunk(x, z, false);
+                if (chunk != null && !chunk.isEmpty()) {
+                    this.corridorContext.queueForPacking(chunk, true);
+                } else {
+                    this.corridorContext.queueAir(x, z);
+                }
+            } else {
+                this.maskedKeys.add(key);
+                this.corridorContext.queueSolid(x, z);
+            }
+        }
+        this.ringMask();
+    }
+
+    /**
+     * Masks solid, once, every chunk within {@link Settings#elytraCorridorMaskRadius} of the player that is not
+     * in the corridor, loaded or not. The pathfinder treats a chunk it was never given as air, so without this
+     * the search would leave the corridor through the unloaded fringe the moment the corridor bends. Runs on
+     * every push, and also whenever the player has moved to another chunk between pushes: the corridor is only
+     * pushed when it changes, and in the seconds it does not the player would otherwise fly out of the ring.
+     */
+    private void ringMask() {
+        final int radius = Baritone.settings().elytraCorridorMaskRadius.value;
+        final ChunkPos center = ctx.player().chunkPosition();
+        this.lastRingCenter = center.toLong();
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                final int x = center.x + dx;
+                final int z = center.z + dz;
+                final long key = ChunkPos.asLong(x, z);
+                if (!process.corridorContains(key) && this.maskedKeys.add(key)) {
+                    this.corridorContext.queueSolid(x, z);
+                }
+            }
+        }
+    }
+
+    /**
+     * Makes sure a corridor search can start from {@code src}: the loaded 3x3 chunks around it are packed as real
+     * terrain into the corridor context whether or not they are in the corridor. The pathfinder's search for an
+     * open cube to start in walks straight through solid, so from a start inside a masked chunk it would settle
+     * on some far cube on the other side of the wall and the path would begin nowhere near us. Transient by
+     * design: the next repack of these chunks masks them again if they are outside the corridor, which is why
+     * they leave {@link #maskedKeys} here instead of being recorded as masked while they are not. Queued on the
+     * corridor context's executor ahead of the search itself, so the search sees them.
+     */
+    private void corridorAdmit(final BlockPos src) {
+        if (this.corridorContext == null || !ctx.minecraft().isSameThread() || ctx.world() == null) {
+            return;
+        }
+        final ChunkSource chunkSource = ctx.world().getChunkSource();
+        final int centerX = src.getX() >> 4;
+        final int centerZ = src.getZ() >> 4;
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                final LevelChunk chunk = chunkSource.getChunk(centerX + dx, centerZ + dz, false);
+                if (chunk != null && !chunk.isEmpty()) {
+                    this.maskedKeys.remove(chunk.getPos().toLong());
+                    this.corridorContext.queueForPacking(chunk, true);
+                }
+            }
+        }
     }
 
     public void onReceivePacket(PacketEvent event) {
@@ -660,6 +899,12 @@ public final class ElytraBehavior implements Helper {
         }
         // otherwise a search is still wedged in native code: freeing under it would be a use-after-free, so
         // the context is abandoned. The leak is bounded to one context per wedged search.
+        if (this.corridorContext != null && this.corridorContext.shutdown()) {
+            // Same rules as the main context: freed on the game thread once its executor has drained, and
+            // abandoned if a search is wedged in it. Its bounded wait comes after the main context's, so a
+            // teardown with both wedged takes twice the timeout, on the Baritone executor.
+            ctx.minecraft().execute(this.corridorContext::free);
+        }
     }
 
     public void repackChunks() {
@@ -681,8 +926,14 @@ public final class ElytraBehavior implements Helper {
 
                 if (chunk != null && !chunk.isEmpty()) {
                     this.context.queueForPacking(chunk);
+                    this.feedCorridor(chunk);
                 }
             }
+        }
+        if (this.corridorContext != null && process.hasCorridor()) {
+            // This runs when the behavior is built, before its first search, and the ring otherwise only appears
+            // on the next corridor push. Until then the unloaded fringe would be air to the search.
+            this.ringMask();
         }
     }
 
@@ -690,9 +941,32 @@ public final class ElytraBehavior implements Helper {
         synchronized (this.context.cullingLock) {
             this.onTick0();
         }
+        if (this.corridorContext != null && process.hasCorridor()
+                && ctx.player().chunkPosition().toLong() != this.lastRingCenter) {
+            this.ringMask();
+        }
         final long now = System.currentTimeMillis();
         if ((now - this.timeLastCacheCull) / 1000 > Baritone.settings().elytraTimeBetweenCacheCullSecs.value) {
-            this.context.queueCacheCulling(ctx.player().chunkPosition().x, ctx.player().chunkPosition().z, Baritone.settings().elytraCacheCullDistance.value, this.boi);
+            final int chunkX = ctx.player().chunkPosition().x;
+            final int chunkZ = ctx.player().chunkPosition().z;
+            final int cullDistance = Baritone.settings().elytraCacheCullDistance.value;
+            this.context.queueCacheCulling(chunkX, chunkZ, cullDistance, this.boi);
+            if (this.corridorContext != null) {
+                // No octree interface reads the corridor context, hence null. The cull erases masked chunks like
+                // any other, so forget them here with the native side's own distance rule (chunk units, squared),
+                // or the ring mask would never mask a chunk we come back to again.
+                this.corridorContext.queueCacheCulling(chunkX, chunkZ, cullDistance, null);
+                final long maxDistSq = (long) (cullDistance / 16) * (cullDistance / 16);
+                final LongIterator it = this.maskedKeys.iterator();
+                while (it.hasNext()) {
+                    final long key = it.nextLong();
+                    final long dx = ChunkPos.getX(key) - chunkX;
+                    final long dz = ChunkPos.getZ(key) - chunkZ;
+                    if (dx * dx + dz * dz > maxDistSq) {
+                        it.remove();
+                    }
+                }
+            }
             this.timeLastCacheCull = now;
         }
     }

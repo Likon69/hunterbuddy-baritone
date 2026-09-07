@@ -45,6 +45,8 @@ import baritone.process.elytra.NullElytraProcess;
 import baritone.utils.BaritoneProcessHelper;
 import baritone.utils.PathingCommandContext;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.LongSet;
+import it.unimi.dsi.fastutil.longs.LongSets;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -55,6 +57,7 @@ import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.monster.piglin.PiglinBrute;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.AirBlock;
 import net.minecraft.world.level.block.Block;
@@ -74,6 +77,14 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private Goal goal;
     private ElytraBehavior behavior;
     private boolean predictingTerrain;
+    /**
+     * The chunks the elytra path is allowed to use, as {@link ChunkPos#asLong} keys, already dilated by the
+     * half width the caller asked for. Empty means no corridor. It lives here and not on the behavior because
+     * {@link #pathTo0} throws the behavior away and builds a new one for every destination, and the corridor
+     * has to survive that so the new behavior can start with it. Replaced wholesale on every push, never
+     * mutated, so a reader on any thread sees a consistent set.
+     */
+    private volatile LongSet corridor = LongSets.EMPTY_SET;
     /**
      * The shortest drop {@link WalkOffCalculationContext} offers, and therefore the least we have to ask to descend
      * for the walk off path to be forced to contain a {@link MovementFall} instead of a flight of stairs.
@@ -804,6 +815,74 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             throw new IllegalArgumentException("The y of the goal is not between 0 and 128");
         }
         this.pathTo(new BlockPos(x, y, z));
+    }
+
+    /**
+     * Restricts the elytra path search to a corridor of chunks. Meant to be called by another mod (by
+     * reflection, since it is not part of {@link IElytraProcess}), from any thread: the work hops to the game
+     * thread itself, because the refresh it triggers reads loaded chunks.
+     *
+     * @param chunkKeys       The chunks the path may use, as {@link ChunkPos#asLong} keys
+     * @param halfWidthChunks How far to widen the corridor on every side of those chunks, in chunks (Chebyshev)
+     */
+    public void setPathCorridor(long[] chunkKeys, int halfWidthChunks) {
+        if (!ctx.minecraft().isSameThread()) {
+            ctx.minecraft().execute(() -> this.setPathCorridor(chunkKeys, halfWidthChunks));
+            return;
+        }
+        final int width = 2 * halfWidthChunks + 1;
+        final LongOpenHashSet next = new LongOpenHashSet(chunkKeys.length * width * width);
+        for (long key : chunkKeys) {
+            final int x = ChunkPos.getX(key);
+            final int z = ChunkPos.getZ(key);
+            for (int dx = -halfWidthChunks; dx <= halfWidthChunks; dx++) {
+                for (int dz = -halfWidthChunks; dz <= halfWidthChunks; dz++) {
+                    next.add(ChunkPos.asLong(x + dx, z + dz));
+                }
+            }
+        }
+        // Only the chunks whose membership changed need touching in the corridor context, and the sets are
+        // mostly the same from one push to the next, so the symmetric difference is what the refresh gets.
+        final LongSet previous = this.corridor;
+        final LongOpenHashSet flipped = new LongOpenHashSet();
+        for (long key : next) {
+            if (!previous.contains(key)) {
+                flipped.add(key);
+            }
+        }
+        for (long key : previous) {
+            if (!next.contains(key)) {
+                flipped.add(key);
+            }
+        }
+        this.corridor = next;
+        if (this.behavior != null && Baritone.settings().elytraCorridor.value) {
+            this.behavior.corridorRefresh(flipped);
+        }
+    }
+
+    /**
+     * Removes the corridor, so the next searches use the whole map again. Same calling rules as
+     * {@link #setPathCorridor}.
+     */
+    public void clearPathCorridor() {
+        this.setPathCorridor(new long[0], 0);
+    }
+
+    /**
+     * @return Whether a corridor is currently set. Public because the behavior that consumes it lives in another
+     *         package; a volatile read, safe from any thread.
+     */
+    public boolean hasCorridor() {
+        return !this.corridor.isEmpty();
+    }
+
+    /**
+     * @param key A {@link ChunkPos#asLong} chunk key
+     * @return Whether that chunk is inside the (already dilated) corridor
+     */
+    public boolean corridorContains(long key) {
+        return this.corridor.contains(key);
     }
 
     private boolean shouldLandForSafety() {

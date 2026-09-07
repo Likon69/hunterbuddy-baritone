@@ -46,6 +46,22 @@ import java.util.concurrent.TimeUnit;
 public final class NetherPathfinderContext {
 
     private static final BlockState AIR_BLOCK_STATE = Blocks.AIR.defaultBlockState();
+    /**
+     * A whole chunk of solid, in the layout {@code NetherPathfinder.insertChunkData} expects (index
+     * {@code y << 8 | z << 4 | x}, 16x128x16). Inserted for every chunk a corridor search must not enter. The
+     * native side copies the array and never writes back, so one shared instance is safe.
+     */
+    private static final boolean[] ALL_SOLID = new boolean[16 * 16 * 128];
+    /**
+     * A whole chunk of air, same layout as {@link #ALL_SOLID}. Inserted to wipe a chunk before it is packed
+     * again, and for a corridor chunk the client has not received yet.
+     */
+    private static final boolean[] ALL_AIR = new boolean[16 * 16 * 128];
+
+    static {
+        java.util.Arrays.fill(ALL_SOLID, true);
+    }
+
     // This lock must be held while there are active pointers to chunks in java,
     // but we just hold it for the entire tick so we don't have to think much about it.
     public final Object cullingLock = new Object();
@@ -82,26 +98,70 @@ public final class NetherPathfinderContext {
         }
     }
 
+    /**
+     * @param boi The octree interface whose cached chunk pointer must be dropped before the cull frees chunks, or
+     *            {@code null} for a context nothing reads through such an interface (the corridor context)
+     */
     public void queueCacheCulling(int chunkX, int chunkZ, int maxDistanceBlocks, BlockStateOctreeInterface boi) {
         this.executeTask(() -> {
             synchronized (this.cullingLock) {
-                boi.chunkPtr = 0L;
+                if (boi != null) {
+                    boi.chunkPtr = 0L;
+                }
                 NetherPathfinder.cullFarChunks(this.context, chunkX, chunkZ, maxDistanceBlocks);
             }
         });
     }
 
     public void queueForPacking(final LevelChunk chunkIn) {
+        this.queueForPacking(chunkIn, false);
+    }
+
+    /**
+     * Packs the chunk's blocks into this context's cache on the context's executor.
+     *
+     * @param resetFirst Replace the cached chunk with all air before packing. {@code writeChunkData} only writes
+     *                   the sections the chunk actually has, so packing over a chunk that was inserted as all
+     *                   solid would leave every empty section solid; the wipe is what makes a masked chunk turn
+     *                   back into real terrain. It replaces the cache entry, which frees the old one: never use
+     *                   it on a context a {@link BlockStateOctreeInterface} reads from, since that interface
+     *                   keeps a raw pointer to the last chunk it looked at.
+     */
+    public void queueForPacking(final LevelChunk chunkIn, final boolean resetFirst) {
         final SoftReference<LevelChunk> ref = new SoftReference<>(chunkIn);
+        final int chunkX = chunkIn.getPos().x;
+        final int chunkZ = chunkIn.getPos().z;
         this.executeTask(() -> {
             // TODO: Prioritize packing recent chunks and/or ones that the path goes through,
             //       and prune the oldest chunks per chunkPackerQueueMaxSize
             final LevelChunk chunk = ref.get();
             if (chunk != null) {
-                long ptr = NetherPathfinder.getOrCreateChunk(this.context, chunk.getPos().x, chunk.getPos().z);
+                if (resetFirst) {
+                    NetherPathfinder.insertChunkData(this.context, chunkX, chunkZ, ALL_AIR);
+                }
+                long ptr = NetherPathfinder.getOrCreateChunk(this.context, chunkX, chunkZ);
                 writeChunkData(chunk, ptr);
             }
         });
+    }
+
+    /**
+     * Replaces the cached chunk with one that is solid from bedrock to the roof, so that no search in this
+     * context can pass through it. Runs on this context's executor like every other cache write: the native
+     * insert swaps the cache entry, and a search running on the same context reads the cache without a lock,
+     * so the two must never overlap.
+     */
+    public void queueSolid(final int chunkX, final int chunkZ) {
+        this.executeTask(() -> NetherPathfinder.insertChunkData(this.context, chunkX, chunkZ, ALL_SOLID));
+    }
+
+    /**
+     * Replaces the cached chunk with one that is all air, which is what a chunk the pathfinder has never been
+     * given amounts to during a search. Used to undo {@link #queueSolid} for a chunk the client has not loaded,
+     * where there is nothing real to pack in its place.
+     */
+    public void queueAir(final int chunkX, final int chunkZ) {
+        this.executeTask(() -> NetherPathfinder.insertChunkData(this.context, chunkX, chunkZ, ALL_AIR));
     }
 
     public void queueBlockUpdate(BlockChangeEvent event) {
@@ -119,6 +179,14 @@ public final class NetherPathfinderContext {
     }
 
     public CompletableFuture<PathSegment> pathFindAsync(final BlockPos src, final BlockPos dst) {
+        return this.pathFindAsync(src, dst, Baritone.settings().elytraPathNodeSize.value >= 4);
+    }
+
+    /**
+     * @param atLeastX4 Search with 4-block nodes ({@code true}) or 2-block nodes ({@code false}). The fine search
+     *                  gets through gaps a gliding player fits through; the wide one is several times faster.
+     */
+    public CompletableFuture<PathSegment> pathFindAsync(final BlockPos src, final BlockPos dst, final boolean atLeastX4) {
         try {
             return CompletableFuture.supplyAsync(() -> {
                 if (this.destroyed) {
@@ -128,7 +196,7 @@ public final class NetherPathfinderContext {
                         this.context,
                         src.getX(), src.getY(), src.getZ(),
                         dst.getX(), dst.getY(), dst.getZ(),
-                        true,
+                        atLeastX4,
                         false,
                         10000,
                         !Baritone.settings().elytraPredictTerrain.value

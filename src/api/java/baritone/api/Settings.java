@@ -1528,6 +1528,37 @@ public final class Settings {
     public final Setting<Boolean> elytraPredictTerrain = new Setting<>(false);
 
     /**
+     * The minimum size of the nodes the nether pathfinder searches with, {@code 4} or {@code 2}. With {@code 4}
+     * the path only ever goes through openings at least 4x4x4 blocks wide, so it routes around a whole massif
+     * wherever a gliding player slipped through a crevice. {@code 2} lets the path go through gaps a gliding
+     * player fits through, at the price of a slower search and tighter flying.
+     */
+    public final Setting<Integer> elytraPathNodeSize = new Setting<>(4);
+
+    /**
+     * Search with 4-block nodes first and, when that only produces a stub (an unfinished path that ends within
+     * 64 blocks of where it started, meaning the search was boxed in), search again with 2-block nodes. Keeps
+     * the fast wide search for the common case and only pays for the fine one where a gap needs it.
+     */
+    public final Setting<Boolean> elytraPathNodeAdaptive = new Setting<>(true);
+
+    /**
+     * Honour a path corridor pushed by another mod (a set of chunks the path is allowed to use, for instance a
+     * trail being followed). The path is searched inside the corridor first, with everything outside it treated
+     * as solid, and the full map is only consulted when the corridor has no way through. No effect while no
+     * corridor has been pushed.
+     */
+    public final Setting<Boolean> elytraCorridor = new Setting<>(true);
+
+    /**
+     * Radius, in chunks, around the player in which every chunk that is not in the corridor is masked solid in
+     * the corridor search, whether or not the client has that chunk loaded. Chunks the pathfinder has never
+     * been given count as air, so without this ring the search would simply leave the corridor through the
+     * unloaded fringe and defeat the point of it.
+     */
+    public final Setting<Integer> elytraCorridorMaskRadius = new Setting<>(12);
+
+    /**
      * Automatically swap the current elytra with a new one when the durability gets too low
      */
     public final Setting<Boolean> elytraAutoSwap = new Setting<>(true);
