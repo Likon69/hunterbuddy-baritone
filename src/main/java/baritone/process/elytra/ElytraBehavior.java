@@ -664,7 +664,7 @@ public final class ElytraBehavior implements Helper {
 
         final Settings settings = Baritone.settings();
         if (this.visiblePath != null) {
-            PathRenderer.drawPath(event.getModelViewStack(), this.visiblePath, 0, Color.RED, false, 0, 0, 0.0D);
+            PathRenderer.drawPath(event.getModelViewStack(), this.visiblePath, 0, settings.elytraPathColor.value, false, 0, 0, 0.0D);
         }
         if (this.aimPos != null) {
             PathRenderer.drawGoal(event.getModelViewStack(), ctx, new GoalBlock(this.aimPos), event.getPartialTicks(), Color.GREEN);
@@ -1826,8 +1826,12 @@ public final class ElytraBehavior implements Helper {
             motion = step(motion, lookDirection, rotation.getPitch(), context.gravity, context.slowFalling);
             delta = delta.subtract(motion);
 
-            // Collision box while the player is in motion, with additional padding for safety
-            final AABB inMotion = hitbox.inflate(motion.x, motion.y, motion.z).inflate(0.01);
+            // Swept collision box: grow the hitbox ONLY in the direction of travel, plus a hair of
+            // padding. The old inflate(motion) grew symmetrically, so it also reached backwards and
+            // downwards into the block behind/under the player — which at takeoff is the ground, and
+            // made the solver see a collision that was not on the flight path and report "no pitch
+            // solution" (upstream #5047/#5052, issue #5094). expandTowards is the vanilla swept volume.
+            final AABB inMotion = hitbox.expandTowards(motion.x, motion.y, motion.z).inflate(0.01);
 
             int xmin = fastFloor(inMotion.minX);
             int xmax = fastCeil(inMotion.maxX);
