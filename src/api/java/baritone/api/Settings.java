@@ -1489,6 +1489,12 @@ public final class Settings {
     public final Setting<Boolean> elytraRenderSimulation = new Setting<>(true);
 
     /**
+     * The colour of the elytra flight path line drawn ahead of you (the one that runs on into
+     * predicted terrain). Red by default.
+     */
+    public final Setting<Color> elytraPathColor = new Setting<>(Color.RED);
+
+    /**
      * Automatically path to and jump off of ledges to initiate elytra flight when grounded.
      */
     public final Setting<Boolean> elytraAutoJump = new Setting<>(false);
