@@ -24,6 +24,7 @@ import baritone.api.event.events.type.EventState;
 import baritone.api.event.listener.AbstractGameEventListener;
 import baritone.api.pathing.goals.Goal;
 import baritone.api.pathing.goals.GoalBlock;
+import baritone.api.pathing.goals.GoalComposite;
 import baritone.api.pathing.goals.GoalXZ;
 import baritone.api.pathing.goals.GoalYLevel;
 import baritone.api.pathing.movement.IMovement;
@@ -116,6 +117,41 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      * further up is out of reach of a vertical takeoff anyway.
      */
     private static final int TAKEOFF_MAX_EXIT_HEIGHT = 32;
+    /**
+     * How far above our feet {@link #liftHeight} will look for a stance a takeoff can actually leave from. A
+     * duration-1 rocket lifts a stationary player around 25 blocks, and every one of these blocks has to be
+     * climbed (placed or mined) before the takeoff even starts, so past this it is cheaper to walk somewhere else.
+     */
+    private static final int TAKEOFF_MAX_LIFT = 24;
+    /**
+     * How far the way out of a launch stance has to be clear, horizontally, for the takeoff to have anywhere to
+     * go. Roughly the distance a takeoff rocket covers before it dies.
+     */
+    private static final int TAKEOFF_RUNWAY = 16;
+    /**
+     * The climbs tested over that runway, shallowest first: flat enough to fit under a nether ceiling, steep
+     * enough to clear the rim of a crevice. A stance counts as clear when any one of them is.
+     */
+    private static final int[] TAKEOFF_RUNWAY_RISES = {2, 6, 10};
+    /** How far around us {@link #walkToLaunch} looks for another spot to take off from. */
+    private static final int TAKEOFF_RELOCATE_RADIUS = 16;
+    /** The vertical band of that search, above and below our feet. */
+    private static final int TAKEOFF_RELOCATE_HEIGHT = 12;
+    /** How many spots that search offers the pathfinder at once, and how many columns it is allowed to test. */
+    private static final int TAKEOFF_RELOCATE_SPOTS = 8;
+    private static final int TAKEOFF_RELOCATE_COLUMN_BUDGET = 400;
+    /** How many times one takeoff may give up on a spot and walk to another one before admitting defeat. */
+    private static final int MAX_RELOCATIONS = 2;
+    /** How many times it may climb, likewise. */
+    private static final int MAX_CLIMBS = 2;
+    /** How far to walk towards the goal when even the relocation search has nothing to offer. */
+    private static final int TAKEOFF_WALK_ONWARDS = 48;
+    /** How far we have to move for the ladder to consider itself at a new spot and start over from the top. */
+    private static final int TAKEOFF_SAME_SPOT_RADIUS = 8;
+    /** How long the ladder's memory of a spot survives with nothing happening. */
+    private static final int TAKEOFF_MEMORY_TICKS = 20 * 180;
+    /** The pitch a takeoff holds while it jumps, so the glide starts pointing up and down the goal line. */
+    private static final float TAKEOFF_PITCH = -30.0F;
     private int takeoffStallTicks;
     private int standingTakeoffs;
     private int walkOffAttempts;
@@ -129,10 +165,30 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      */
     private int takeoffOpenedTicksAgo = -1;
     private boolean lavaPathRequested;
-    /** Whether this takeoff sequence has already pillared up once. One pillar per sequence: a spot that still fails after it is walled in some other way a pillar can't fix. */
+    /** Whether this takeoff sequence has already climbed once. One climb per spot: a stance that still fails after it is walled in some other way height can't fix. */
     private boolean pillared;
     /** The feet-Y the current pillar is climbing to. */
     private int pillarTargetY;
+    /**
+     * The rungs of the takeoff ladder, in the order they are tried. Each one is a different answer to "how do
+     * we get into the air from here", not a retry of the last one: jump on the spot, climb to where jumping
+     * works, walk to where it works, and only then give up.
+     */
+    private enum Stage {LAUNCH, CLIMB, RELOCATE, EXHAUSTED}
+
+    /**
+     * Where the ladder below is being run, and how far down it has got. Deliberately <i>not</i> cleared by
+     * {@link #onLostControl}: every failure in here tears the behavior down, and the mod driving us hands the
+     * same goal straight back, so a ladder that lived on the behavior would restart at the top every few
+     * seconds and burn the same three rockets on the same bad spot forever - which is exactly what it used to
+     * do. {@link #forgetTakeoffSpot} is what clears it, when we have actually flown, moved, or waited long
+     * enough that the spot is no longer the one that failed.
+     */
+    private BetterBlockPos takeoffSpot;
+    private Stage takeoffStage = Stage.LAUNCH;
+    private int takeoffSpotTick;
+    private int relocations;
+    private int climbs;
 
     @Override
     public void onLostControl() {
@@ -142,14 +198,15 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         this.reachedGoal = false;
         this.goal = null;
         this.takeoffStallTicks = 0;
-        this.standingTakeoffs = 0;
+        // standingTakeoffs and pillared are deliberately left alone: they belong to the spot the takeoff
+        // ladder is working on, not to the behavior, and the whole point of that ladder is that it survives
+        // this teardown. rememberTakeoffSpot clears them when we are somewhere else.
         this.walkOffAttempts = 0;
         this.takeoffAirborneTicks = 0;
         this.walkOffImpossible = false;
         this.takeoffBoostPending = false;
         this.takeoffOpenedTicksAgo = -1;
         this.lavaPathRequested = false;
-        this.pillared = false;
         this.pillarTargetY = 0;
         destroyBehaviorAsync();
     }
@@ -203,11 +260,17 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         }
 
         if (calcFailed) {
-            if (this.state == State.LOCATE_JUMP || this.state == State.GET_TO_JUMP || this.state == State.PILLAR_UP) {
-                // PILLAR_UP included: a failed calculation to the pillar goal falls back to
-                // standingTakeoff() the same way GET_TO_JUMP's own walking failures already do --
-                // this.pillared is already true by the time we can get here, so it takes off from
-                // wherever the climb got to rather than starting a second pillar.
+            if (this.state == State.PILLAR_UP) {
+                // Nothing to climb to that a path can reach; the next rung looks somewhere else instead of
+                // asking for the same climb again.
+                this.takeoffStage = Stage.RELOCATE;
+            } else if (this.state == State.WALK_TO_LAUNCH) {
+                this.takeoffStage = Stage.EXHAUSTED;
+            }
+            if (this.state == State.LOCATE_JUMP || this.state == State.GET_TO_JUMP
+                    || this.state == State.PILLAR_UP || this.state == State.WALK_TO_LAUNCH) {
+                // All four hand back to the ladder, which decides what to try next based on how far down it
+                // already is rather than repeating whatever just failed.
                 return standingTakeoff();
             }
             onLostControl();
@@ -278,6 +341,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         }
 
         if (ctx.player().isFallFlying()) {
+            // We are in the air: whatever the ladder was working through is answered, and the next takeoff -
+            // wherever and whenever it happens - starts from the top again.
+            forgetTakeoffSpot();
             if (this.state == State.TAKEOFF_JUMP) {
                 // the elytra opened without us having asked for it, pick up from wherever that leaves us
                 this.state = State.START_FLYING;
@@ -368,7 +434,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                             this.state = State.GET_TO_JUMP;
                             return;
                         }
-                        onLostControl();
+                        // No flight path out of that ledge. That says something about the ledge, not about the
+                        // flight: hand it back to the ladder instead of ending the whole thing here.
+                        takeoffPathFailed();
                     });
                     this.state = State.PAUSE;
                 } else {
@@ -396,6 +464,14 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                         : "Got into the air but the elytra wouldn't open. ");
             }
             baritone.getInputOverrideHandler().clearAllKeys();
+            // Face the goal, tilted up, for the whole jump. The elytra keeps whatever direction it opened
+            // facing, and the takeoff rocket is spent along it, so without this a takeoff leaves along
+            // whatever the last walking movement happened to leave the head pointing at - into the wall we
+            // just walked up to, as often as not. The solver takes the look back the moment it is flying.
+            final Rotation aim = takeoffAim();
+            if (aim != null) {
+                baritone.getLookBehavior().updateTarget(aim, false);
+            }
             if (ctx.player().onGround()) {
                 // an ordinary jump. vanilla physics, and the movement packets it produces are what the server
                 // checks its own idea of onGround against before it will accept the request below
@@ -445,10 +521,12 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
         if (this.state == State.PILLAR_UP) {
             if (ctx.player().onGround() && ctx.playerFeet().y >= this.pillarTargetY) {
-                // Climbed high enough: back to standingTakeoff() to actually take off from here.
-                // this.pillared is already true, so this pass through can't start a second pillar.
+                // Climbed high enough: try the launch again from up here. this.pillared stays set, so if it
+                // still doesn't work the ladder moves on to walking somewhere else instead of climbing twice.
                 baritone.getPathingBehavior().secretInternalSegmentCancel();
                 this.goal = null;
+                this.takeoffStage = Stage.LAUNCH;
+                this.standingTakeoffs = 0;
                 return standingTakeoff();
             }
 
@@ -456,10 +534,35 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             if (executor != null || baritone.getPathingBehavior().getInProgress().isPresent()) {
                 this.takeoffStallTicks = 0;
             } else if (++this.takeoffStallTicks > TAKEOFF_STALL_TICKS) {
-                // Stalled climbing (ran out of blocks mid-pillar, obstruction) -- give up on the
-                // pillar and let standingTakeoff() fall through to its ordinary abort messages
-                // rather than sitting here forever.
+                // Stalled climbing (ran out of blocks mid-pillar, obstruction) -- the height we wanted isn't
+                // reachable from here, so stop asking for it and go look somewhere else.
                 this.goal = null;
+                this.takeoffStage = Stage.RELOCATE;
+                return standingTakeoff();
+            }
+            return new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH);
+        }
+
+        if (this.state == State.WALK_TO_LAUNCH) {
+            final BetterBlockPos feet = ctx.playerFeet();
+            if (this.goal != null && ctx.player().onGround() && this.goal.isInGoal(feet.x, feet.y, feet.z)) {
+                // Arrived somewhere that measured as launchable. It is a different spot, so the ladder starts
+                // over from the top there, ledge search included - that is still the cheapest takeoff there is.
+                baritone.getPathingBehavior().secretInternalSegmentCancel();
+                this.goal = null;
+                this.walkOffImpossible = false;
+                this.walkOffAttempts = 0;
+                this.takeoffStallTicks = 0;
+                this.state = State.LOCATE_JUMP;
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+            }
+
+            final IPathExecutor executor = baritone.getPathingBehavior().getCurrent();
+            if (executor != null || baritone.getPathingBehavior().getInProgress().isPresent()) {
+                this.takeoffStallTicks = 0;
+            } else if (++this.takeoffStallTicks > TAKEOFF_STALL_TICKS) {
+                this.goal = null;
+                this.takeoffStage = Stage.EXHAUSTED;
                 return standingTakeoff();
             }
             return new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH);
@@ -480,10 +583,16 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     }
 
     /**
-     * Takes off from where we are standing: jump, open the elytra on the way up, and light a firework the moment
-     * it opens, since a glide that starts with no speed a block and a half off the floor only ends one way. This
-     * is what flat terrain leaves us with, where {@link WalkOffCalculationContext} has no ledge to offer and the
-     * alternative is standing around telling the user to go find a cliff.
+     * Gets into the air from wherever the ground left us, when {@link WalkOffCalculationContext} found no ledge
+     * to walk off.
+     * <p>
+     * There is no one way to do that, which is the whole point: a takeoff needs a stance with room to jump and
+     * an unobstructed line to leave along, and the terrain either hands us one, hides one a few blocks above,
+     * hides one a few blocks away, or has none at all. {@link #liftHeight} measures which of those it is, and
+     * the ladder below tries them in the order of what they cost - a rocket, a pillar, a walk - so a spot that
+     * defeats one is answered by the next instead of by the same rocket three more times. The stage survives
+     * the process being torn down and handed the goal again, so the ladder makes progress across those
+     * restarts rather than starting over from the top every five seconds.
      */
     private PathingCommand standingTakeoff() {
         this.walkOffImpossible = true;
@@ -497,77 +606,375 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         }
 
         final BetterBlockPos feet = ctx.playerFeet();
-        // Ceiling and fireworks first, pillar second, the standing-takeoffs cap third. pillarHeight
-        // deliberately doesn't test headroom itself -- its own javadoc says the ceiling check
-        // already refuses anything under 2 blocks -- which is only true if that check has actually
-        // run by the time pillarHeight is called. Checking it here first, before ever attempting a
-        // pillar, is what makes that true: a spot with a genuinely low ceiling (open on every side,
-        // just short) aborts right here with its ordinary message instead of pillaring up blindly,
-        // possibly straight into solid ground above with allowBreak on. Fireworks first for the
-        // same reason: a pillar is wasted effort if there's nothing to jump with once it's done.
-        // The cap stays after: a pillar that gets us out of a walled-in spot is worth resetting
-        // that counter for, so it has to run before the cap could give up on a spot a few blocks
-        // of climbing would have fixed.
-        if (!MovementHelper.fullyPassable(ctx, feet.above(2)) || !MovementHelper.fullyPassable(ctx, feet.above(3))) {
-            return abortTakeoff("There is no spot to jump off from, and not enough room above me to jump and open the elytra. ");
-        }
+        rememberTakeoffSpot(feet);
+
+        // Fireworks first: every rung below ends in a jump that needs one, so a pillar or a walk is wasted
+        // effort if there is nothing to light at the end of it.
         if (!this.behavior.selectFirework()) {
             return abortTakeoff("There is no spot to jump off from, and no fireworks in my hotbar to take off from here with. ");
         }
 
-        // One pillar per takeoff sequence -- this.pillared only clears in onLostControl -- so a
-        // spot that's still bad after climbing falls through to the cap and the ordinary abort
-        // messages below instead of pillaring over and over.
-        if (Baritone.settings().elytraTakeoffPillar.value && !this.pillared) {
-            if (!baritone.getInventoryBehavior().hasGenericThrowaway()) {
-                logDebug("elytraTakeoffPillar is on but there's no throwaway block in the hotbar to pillar with");
-            } else {
-                int h = pillarHeight(feet);
-                if (h == 0 && this.standingTakeoffs >= 1) {
-                    // Landed right back here once already at "already open" -- the ring test
-                    // passed but the takeoff still failed some other way a few blocks of height
-                    // might still fix (a bad angle for the takeoff exit search, a corner ringOpen's
-                    // 4-neighbour test missed). Worth one climb before accepting the cap. Ceiling and
-                    // fireworks are already known good at this point, so this isn't chasing the low-
-                    // ceiling case the ceiling check above already ruled out.
-                    h = Math.min(3, Baritone.settings().elytraTakeoffPillarMaxHeight.value);
-                }
-                if (h > 0) {
-                    this.pillared = true;
-                    this.pillarTargetY = feet.y + h;
-                    this.standingTakeoffs = 0;
-                    this.goal = new GoalBlock(feet.x, feet.y + h, feet.z);
-                    this.state = State.PILLAR_UP;
-                    this.takeoffStallTicks = 0;
-                    logDirect("Walled in, pillaring up " + h + " blocks before taking off.");
-                    return new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH);
-                }
-            }
-        }
+        // How far above our feet a takeoff would have somewhere to go. 0 means right here; a positive number
+        // means we are in a crevice or a hole whose rim is that far up; -1 means nothing within reach of a
+        // climb, which is a pocket or a cave and only a walk can answer.
+        final int lift = liftHeight(feet);
 
-        if (this.standingTakeoffs >= MAX_STANDING_TAKEOFFS) {
-            return abortTakeoff("Took off from here " + this.standingTakeoffs + " times and ended up back on the ground every time. ");
+        if (this.takeoffStage == Stage.LAUNCH) {
+            if (lift == 0 && this.standingTakeoffs < MAX_STANDING_TAKEOFFS) {
+                return launchFromHere(feet);
+            }
+            this.takeoffStage = Stage.CLIMB;
         }
+        if (this.takeoffStage == Stage.CLIMB) {
+            final PathingCommand climb = climbToLaunch(feet, lift);
+            if (climb != null) {
+                return climb;
+            }
+            this.takeoffStage = Stage.RELOCATE;
+        }
+        if (this.takeoffStage == Stage.RELOCATE) {
+            final PathingCommand walk = walkToLaunch(feet);
+            if (walk != null) {
+                return walk;
+            }
+            this.takeoffStage = Stage.EXHAUSTED;
+        }
+        // Nothing left to try. A rocket into a bad spot still beats standing still, so spend the ones the cap
+        // allows before saying so.
+        if (lift == 0 && this.standingTakeoffs < MAX_STANDING_TAKEOFFS) {
+            return launchFromHere(feet);
+        }
+        return abortTakeoff("Tried taking off from here, climbing out of here, and walking somewhere better, and none of it worked. ");
+    }
+
+    /**
+     * Jump on the spot, open the elytra on the way up, and light a firework the moment it opens, since a glide
+     * that starts with no speed a block and a half off the floor only ends one way.
+     */
+    private PathingCommand launchFromHere(BetterBlockPos feet) {
         if (this.standingTakeoffs++ == 0) {
             logDirect("No spot to jump off from, taking off from here instead.");
         }
-        // The path starts from the first clear cube straight above us, which is where a climb on the takeoff
-        // rocket comes out. In a basalt delta crevice or the hollow beside a lava pond the walls are a couple of
-        // blocks away on every side, and up is the one direction that is reliably clear. Left to itself the
-        // pathfinder would start from the nearest clear cube to our feet, and its search for one ignores walls:
-        // from a hole that is very often a cube on the far side of one, which nothing here could ever reach.
-        final BetterBlockPos exit = takeoffExit(feet);
+        // Where the elytra path starts matters more than anything else here: the solver aims at its first node
+        // and the takeoff rocket is spent along that aim, so a path that starts inside the hole we are trying
+        // to leave points the boost straight back into its wall.
+        final BetterBlockPos start = launchPathStart(feet);
         // the elytra path has to exist before we leave the ground: the behavior does nothing without one, and the
         // handful of ticks between opening the elytra and hitting the ground is no time to compute one
         this.state = State.PAUSE;
-        this.behavior.pathManager.pathToDestination(exit != null ? exit : feet).whenComplete((result, ex) -> {
+        this.behavior.pathManager.pathToDestination(start).whenComplete((result, ex) -> {
             if (ex == null) {
                 this.state = State.TAKEOFF_JUMP;
                 return;
             }
-            onLostControl();
+            takeoffPathFailed();
         });
         return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+    }
+
+    /**
+     * Climbs to the stance {@link #liftHeight} found above us, by pillaring or mining - this goes out on the
+     * ordinary calculation context, unlike the ledge search, precisely so that the pathfinder is allowed to
+     * place and break its way up. {@code null} when there is nothing above worth climbing to, or no way to
+     * climb, so the caller can move on to the next rung.
+     */
+    private PathingCommand climbToLaunch(BetterBlockPos feet, int lift) {
+        if (lift <= 0 || this.pillared || !Baritone.settings().elytraTakeoffPillar.value) {
+            return null;
+        }
+        if (this.climbs >= MAX_CLIMBS) {
+            // A climb moves us far enough that the ladder starts over at the top, so without a cap of its own
+            // a spot that measures as climbable again from every height it reaches would pillar to the roof.
+            return null;
+        }
+        if (lift > Baritone.settings().elytraTakeoffPillarMaxHeight.value) {
+            // Deeper than a crevice. Climbing out of a shaft this tall costs a jump a block and gets us
+            // nowhere the walk below couldn't reach more cheaply.
+            return null;
+        }
+        final boolean canPlace = Baritone.settings().allowPlace.value
+                && baritone.getInventoryBehavior().hasGenericThrowaway();
+        final boolean canBreak = Baritone.settings().allowBreak.value;
+        if (!canPlace && !canBreak) {
+            logDebug("walled in, but there's nothing to pillar with and allowBreak is off");
+            return null;
+        }
+        this.pillared = true;
+        this.climbs++;
+        this.pillarTargetY = feet.y + lift;
+        this.standingTakeoffs = 0;
+        this.goal = new GoalBlock(feet.x, this.pillarTargetY, feet.z);
+        this.state = State.PILLAR_UP;
+        this.takeoffStallTicks = 0;
+        logDirect("Nothing to take off into from here, climbing " + lift + " blocks to where there is.");
+        return new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH);
+    }
+
+    /**
+     * Walks to the nearest spots around us that a takeoff would actually work from, on the ordinary calculation
+     * context so the pathfinder may dig and bridge its way there. This is the rung that leaves a sealed pocket
+     * or the top of a fungus canopy, neither of which any amount of jumping or climbing on the spot can fix.
+     * {@code null} when there is nowhere better within range, or we have already moved twice.
+     */
+    private PathingCommand walkToLaunch(BetterBlockPos feet) {
+        if (this.relocations >= MAX_RELOCATIONS) {
+            return null;
+        }
+        final List<Goal> spots = findLaunchSpots(feet);
+        final String what;
+        if (!spots.isEmpty()) {
+            this.goal = new GoalComposite(spots.toArray(new Goal[0]));
+            what = "walking to one of " + spots.size() + " spots nearby that will work";
+        } else {
+            // Nothing within range measures as launchable, which in a cave system is perfectly possible. Set
+            // off towards the destination on foot instead and ask again from there: it is the one direction
+            // where walking is not wasted even if it takes a while to find sky.
+            final Goal onwards = walkOnwardsGoal(feet);
+            if (onwards == null) {
+                return null;
+            }
+            this.goal = onwards;
+            what = "no spot around here works either, walking on towards the goal to look further";
+        }
+        this.relocations++;
+        this.state = State.WALK_TO_LAUNCH;
+        this.takeoffStallTicks = 0;
+        logDirect("Nowhere to take off from here, " + what + ".");
+        return new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH);
+    }
+
+    /** A point {@link #TAKEOFF_WALK_ONWARDS} blocks towards the destination, or {@code null} without one. */
+    private Goal walkOnwardsGoal(BetterBlockPos feet) {
+        final BetterBlockPos dest = this.behavior != null ? this.behavior.destination : null;
+        if (dest == null) {
+            return null;
+        }
+        final double dx = dest.x - feet.x;
+        final double dz = dest.z - feet.z;
+        final double len = Math.sqrt(dx * dx + dz * dz);
+        if (len < 1) {
+            return null;
+        }
+        final double reach = Math.min(len, TAKEOFF_WALK_ONWARDS);
+        return new GoalXZ(
+                feet.x + (int) Math.round(dx / len * reach),
+                feet.z + (int) Math.round(dz / len * reach)
+        );
+    }
+
+    /**
+     * A takeoff path computation failed. Called from the pathfinder's own thread, so it only sets fields, the
+     * same way the success side of those handlers already does.
+     * <p>
+     * This used to be {@link #onLostControl}, which ended the flight outright and left the bot standing there
+     * until something else noticed and handed the goal back - and since nothing was remembered across that,
+     * what came back was the identical attempt. It is a fact about this spot, so it advances the ladder past
+     * whatever rung asked for that path and goes round again.
+     */
+    private void takeoffPathFailed() {
+        if (this.takeoffStage == Stage.LAUNCH) {
+            this.takeoffStage = Stage.CLIMB;
+        } else if (this.takeoffStage == Stage.CLIMB) {
+            this.takeoffStage = Stage.RELOCATE;
+        }
+        this.goal = null;
+        this.walkOffImpossible = true;
+        this.takeoffStallTicks = 0;
+        this.state = State.LOCATE_JUMP;
+    }
+
+    /** Starts the ladder over when {@code feet} is somewhere other than where it was last run. */
+    private void rememberTakeoffSpot(BetterBlockPos feet) {
+        final int now = ctx.player().tickCount;
+        final boolean sameSpot = this.takeoffSpot != null
+                && this.takeoffSpot.distanceSq(feet) <= TAKEOFF_SAME_SPOT_RADIUS * TAKEOFF_SAME_SPOT_RADIUS
+                && now - this.takeoffSpotTick < TAKEOFF_MEMORY_TICKS;
+        if (!sameSpot) {
+            this.takeoffStage = Stage.LAUNCH;
+            this.standingTakeoffs = 0;
+            this.pillared = false;
+        }
+        this.takeoffSpot = feet;
+        this.takeoffSpotTick = now;
+    }
+
+    /** Drops the ladder's memory of a spot entirely - we are flying, so whatever it was working on is moot. */
+    private void forgetTakeoffSpot() {
+        this.takeoffSpot = null;
+        this.takeoffStage = Stage.LAUNCH;
+        this.relocations = 0;
+        this.climbs = 0;
+        this.standingTakeoffs = 0;
+        this.pillared = false;
+    }
+
+    /**
+     * The lowest number of blocks above {@code feet} at which a takeoff has somewhere to go: room to stand,
+     * jump and open the elytra, and a clear line out of there towards the destination for the rocket to be
+     * spent along. {@code 0} when here will do, {@code -1} when nothing up to {@link #TAKEOFF_MAX_LIFT} will.
+     * <p>
+     * This asks the question the takeoff actually cares about. The lateral "are 3 of my 4 neighbours open"
+     * test it replaces asked a neighbouring one, and answered it wrongly in both directions: in a shaft no
+     * height ever satisfied it, so the climb it existed to trigger never ran, and on open ground a single
+     * boulder two blocks away read as walled in.
+     */
+    private int liftHeight(BetterBlockPos feet) {
+        final int max = Math.min(TAKEOFF_MAX_LIFT, 126 - feet.y);
+        for (int h = 0; h <= max; h++) {
+            if (canLaunchFrom(feet.above(h))) {
+                return h;
+            }
+        }
+        return -1;
+    }
+
+    /** Room to stand, jump and open the elytra at {@code at}, and a way out of it. */
+    private boolean canLaunchFrom(BlockPos at) {
+        for (int dy = 0; dy <= 3; dy++) {
+            if (!MovementHelper.fullyPassable(ctx, at.above(dy))) {
+                return false;
+            }
+        }
+        return launchLineClear(at);
+    }
+
+    /**
+     * Whether a rocket lit at {@code at} has {@link #TAKEOFF_RUNWAY} blocks of nothing in front of it, along
+     * the bearing to the destination, at any of {@link #TAKEOFF_RUNWAY_RISES}. Several rises because the two
+     * things that block a takeoff want opposite answers: a crevice needs a steep line to clear its rim, and
+     * the nether ceiling refuses one.
+     */
+    private boolean launchLineClear(BlockPos at) {
+        final Vec3 from = Vec3.atCenterOf(at).add(0, 1.0, 0);
+        double dx = 0;
+        double dz = 0;
+        final BetterBlockPos dest = this.behavior != null ? this.behavior.destination : null;
+        if (dest != null) {
+            dx = (dest.x + 0.5) - from.x;
+            dz = (dest.z + 0.5) - from.z;
+        }
+        final double len = Math.sqrt(dx * dx + dz * dz);
+        if (len < 1) {
+            // no bearing to speak of (no destination, or we are standing on it): straight up is the only
+            // direction left that means anything
+            dx = 0;
+            dz = 0;
+        } else {
+            dx = dx / len * TAKEOFF_RUNWAY;
+            dz = dz / len * TAKEOFF_RUNWAY;
+        }
+        for (int rise : TAKEOFF_RUNWAY_RISES) {
+            if (rayPassable(from, from.add(dx, rise, dz))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether every block the segment passes through is passable, sampled twice a block. */
+    private boolean rayPassable(Vec3 from, Vec3 to) {
+        final Vec3 step = to.subtract(from);
+        final int samples = Math.max(1, (int) Math.ceil(step.length() * 2));
+        final BlockPos.MutableBlockPos mut = new BlockPos.MutableBlockPos();
+        for (int i = 1; i <= samples; i++) {
+            final Vec3 p = from.add(step.scale((double) i / samples));
+            mut.set((int) Math.floor(p.x), (int) Math.floor(p.y), (int) Math.floor(p.z));
+            if (!isInBounds(mut) || !MovementHelper.fullyPassable(ctx, mut)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Up to {@link #TAKEOFF_RELOCATE_SPOTS} goals, nearest first, on standable ground within
+     * {@link #TAKEOFF_RELOCATE_RADIUS} that {@link #canLaunchFrom} accepts. One surface per column - the
+     * highest one, which out of a hole is its rim - so the scan stays a few thousand block reads.
+     */
+    private List<Goal> findLaunchSpots(BetterBlockPos feet) {
+        final List<int[]> columns = new ArrayList<>();
+        for (int dx = -TAKEOFF_RELOCATE_RADIUS; dx <= TAKEOFF_RELOCATE_RADIUS; dx++) {
+            for (int dz = -TAKEOFF_RELOCATE_RADIUS; dz <= TAKEOFF_RELOCATE_RADIUS; dz++) {
+                final int d = dx * dx + dz * dz;
+                // Anything closer than the ladder's own idea of "the same spot" would be walked to and then
+                // treated as the place that just failed, so the walk would buy nothing.
+                if (d > TAKEOFF_RELOCATE_RADIUS * TAKEOFF_RELOCATE_RADIUS
+                        || d <= TAKEOFF_SAME_SPOT_RADIUS * TAKEOFF_SAME_SPOT_RADIUS) {
+                    continue;
+                }
+                columns.add(new int[]{d, dx, dz});
+            }
+        }
+        columns.sort(Comparator.comparingInt(c -> c[0]));
+
+        final List<Goal> spots = new ArrayList<>();
+        int examined = 0;
+        for (int[] column : columns) {
+            if (spots.size() >= TAKEOFF_RELOCATE_SPOTS || examined >= TAKEOFF_RELOCATE_COLUMN_BUDGET) {
+                break;
+            }
+            examined++;
+            final BetterBlockPos surface = highestFloor(feet.x + column[1], feet.z + column[2], feet.y);
+            if (surface != null && canLaunchFrom(surface)) {
+                spots.add(new GoalBlock(surface.x, surface.y, surface.z));
+            }
+        }
+        return spots;
+    }
+
+    /**
+     * The highest position in the column with solid ground under it, searching from
+     * {@link #TAKEOFF_RELOCATE_HEIGHT} above {@code aroundY} down to the same below it, or {@code null} if the
+     * column has no floor in that band.
+     */
+    private BetterBlockPos highestFloor(int x, int z, int aroundY) {
+        final BlockPos.MutableBlockPos mut = new BlockPos.MutableBlockPos();
+        for (int y = aroundY + TAKEOFF_RELOCATE_HEIGHT; y >= aroundY - TAKEOFF_RELOCATE_HEIGHT; y--) {
+            if (!isInBounds(mut.set(x, y, z))) {
+                continue;
+            }
+            if (MovementHelper.fullyPassable(ctx, mut) && !MovementHelper.fullyPassable(ctx, mut.set(x, y - 1, z))) {
+                return new BetterBlockPos(x, y, z);
+            }
+        }
+        return null;
+    }
+
+    /** Where the look is held through a takeoff jump: the bearing to the destination, tilted up. */
+    private Rotation takeoffAim() {
+        final BetterBlockPos dest = this.behavior != null ? this.behavior.destination : null;
+        if (dest == null) {
+            return null;
+        }
+        final Vec3 from = ctx.player().position();
+        final Vec3 to = new Vec3(((double) dest.x) + 0.5, from.y, ((double) dest.z) + 0.5);
+        if (from.distanceToSqr(to) < 1) {
+            return null;
+        }
+        final Rotation bearing = RotationUtils.calcRotationFromVec3d(from, to, ctx.playerRotations());
+        return new Rotation(bearing.getYaw(), TAKEOFF_PITCH);
+    }
+
+    /**
+     * Where to start the elytra path for a takeoff from {@code feet}: the first clear node cube straight above
+     * us, and failing that the highest air we have over our own head rather than our feet.
+     * <p>
+     * Falling back to the feet is what used to end the flight: with 4-block nodes, the cube our feet sit in is
+     * solid by definition whenever the cube search came back empty, the native search has no start node, and
+     * the exception that raises took the whole process down with it.
+     */
+    private BetterBlockPos launchPathStart(BetterBlockPos feet) {
+        final BetterBlockPos exit = takeoffExit(feet);
+        if (exit != null) {
+            return exit;
+        }
+        int top = feet.y;
+        while (top - feet.y < TAKEOFF_MAX_EXIT_HEIGHT
+                && isInBounds(new BlockPos(feet.x, top + 1, feet.z))
+                && MovementHelper.fullyPassable(ctx, new BlockPos(feet.x, top + 1, feet.z))) {
+            top++;
+        }
+        return new BetterBlockPos(feet.x, top, feet.z);
     }
 
     /**
@@ -586,9 +993,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         if (this.behavior.pathManager.getPath().isEmpty() && !this.lavaPathRequested) {
             // nothing to fly along once we're out; the takeoff states would have computed this
             this.lavaPathRequested = true;
-            final BetterBlockPos feet = ctx.playerFeet();
-            final BetterBlockPos exit = takeoffExit(feet);
-            this.behavior.pathManager.pathToDestination(exit != null ? exit : feet);
+            this.behavior.pathManager.pathToDestination(launchPathStart(ctx.playerFeet()));
         }
         if (!ctx.player().onGround() && openElytra()) {
             this.state = State.START_FLYING;
@@ -598,62 +1003,62 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     }
 
     /**
-     * The centre of the first 4x4x4 cube of air straight above {@code feet}, aligned the way the elytra
-     * pathfinder aligns its nodes, or {@code null} if there is none within {@link #TAKEOFF_MAX_EXIT_HEIGHT}.
+     * The centre of the nearest 4x4x4 cube of air we can actually get to from {@code feet}, aligned the way
+     * the elytra pathfinder aligns its nodes, or {@code null} if there is none within
+     * {@link #TAKEOFF_MAX_EXIT_HEIGHT}.
+     * <p>
+     * Reachable is the whole point and it used to be assumed rather than tested. A cube one grid cell towards
+     * the destination is preferred when there is one, so the path leaves down the goal line instead of
+     * doubling back - but "is that cube air" is not the same question as "can we get into it", and answering
+     * the first while claiming the second is what put the start of the path, and the boost aimed at it,
+     * through the wall next to us: on the far side of a wall is exactly where a cube of air tends to be. Every
+     * candidate now has to be in plain sight of where we are standing, which is what a rocket lit here can
+     * reach.
      */
     private BetterBlockPos takeoffExit(BetterBlockPos feet) {
         // the pathfinder is nether only and its world stops at the roof
         final int limit = Math.min(feet.y + TAKEOFF_MAX_EXIT_HEIGHT, 128 - 4);
         final int ox = feet.x & ~3;
         final int oz = feet.z & ~3;
-        final BlockPos.MutableBlockPos mut = new BlockPos.MutableBlockPos();
-        cubes:
+        int gx = 0;
+        int gz = 0;
+        final BetterBlockPos dest = this.behavior != null ? this.behavior.destination : null;
+        if (dest != null) {
+            if (Math.abs(dest.x - feet.x) >= Math.abs(dest.z - feet.z)) {
+                gx = Integer.signum(dest.x - feet.x) * 4;
+            } else {
+                gz = Integer.signum(dest.z - feet.z) * 4;
+            }
+        }
+        final Vec3 eye = Vec3.atCenterOf(feet).add(0, 1.0, 0);
         for (int oy = feet.y & ~3; oy <= limit; oy += 4) {
-            for (int x = ox; x < ox + 4; x++) {
-                for (int y = oy; y < oy + 4; y++) {
-                    for (int z = oz; z < oz + 4; z++) {
-                        if (!ctx.world().getBlockState(mut.set(x, y, z)).isAir()) {
-                            continue cubes;
-                        }
-                    }
+            if (gx != 0 || gz != 0) {
+                final BetterBlockPos goalward = new BetterBlockPos(ox + gx + 2, oy + 2, oz + gz + 2);
+                if (cubeIsAir(ox + gx, oy, oz + gz) && rayPassable(eye, Vec3.atCenterOf(goalward))) {
+                    return goalward;
                 }
             }
-            return new BetterBlockPos(ox + 2, oy + 2, oz + 2);
+            final BetterBlockPos above = new BetterBlockPos(ox + 2, oy + 2, oz + 2);
+            if (cubeIsAir(ox, oy, oz) && rayPassable(eye, Vec3.atCenterOf(above))) {
+                return above;
+            }
         }
         return null;
     }
 
-    /**
-     * How many blocks {@code feet} would have to pillar up before it isn't walled in any more --
-     * the first height at which the 4 cardinal neighbours of that level and the one above it
-     * (room enough to stand and to open an elytra into) are open on at least 3 of those 4 sides,
-     * {@code 0} if it already qualifies, {@code -1} if no such height turns up within
-     * {@link Settings#elytraTakeoffPillarMaxHeight}. Tolerating one blocked side rather than
-     * demanding all 4: a single bump or a lone column a block or two away on otherwise flat, open
-     * ground would otherwise read as "walled in" and pillar for nothing. Ceiling headroom is
-     * deliberately not tested here: {@link #standingTakeoff} already refuses a spot with less
-     * than 2 blocks above the feet before this is ever called, and pillaring can only make that
-     * worse, never better.
-     */
-    private int pillarHeight(BetterBlockPos feet) {
-        final int max = Baritone.settings().elytraTakeoffPillarMaxHeight.value;
-        for (int h = 0; h <= max; h++) {
-            if (ringOpen(feet.above(h)) && ringOpen(feet.above(h + 1))) {
-                return h;
+    /** True if the whole 4x4x4 node cube at the given corner is air. */
+    private boolean cubeIsAir(int ox, int oy, int oz) {
+        final BlockPos.MutableBlockPos mut = new BlockPos.MutableBlockPos();
+        for (int x = ox; x < ox + 4; x++) {
+            for (int y = oy; y < oy + 4; y++) {
+                for (int z = oz; z < oz + 4; z++) {
+                    if (!ctx.world().getBlockState(mut.set(x, y, z)).isAir()) {
+                        return false;
+                    }
+                }
             }
         }
-        return -1;
-    }
-
-    /** At least 3 of the 4 cardinal neighbours of {@code at} are open -- see {@link #pillarHeight}. */
-    private boolean ringOpen(BlockPos at) {
-        int blocked = 0;
-        for (Direction dir : Direction.Plane.HORIZONTAL) {
-            if (!MovementHelper.fullyPassable(ctx, at.relative(dir))) {
-                blocked++;
-            }
-        }
-        return blocked < 2;
+        return true;
     }
 
     /**
@@ -920,6 +1325,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         PAUSE("Waiting for elytra path"),
         GET_TO_JUMP("Walking to takeoff"),
         PILLAR_UP("Pillaring up to take off"),
+        WALK_TO_LAUNCH("Walking to a spot to take off from"),
         TAKEOFF_JUMP("Taking off"),
         START_FLYING("Begin flying"),
         FLYING("Flying"),

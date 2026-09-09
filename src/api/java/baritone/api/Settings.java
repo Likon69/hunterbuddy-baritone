@@ -1514,12 +1514,13 @@ public final class Settings {
     public final Setting<Boolean> elytraTakeoffPillar = new Setting<>(true);
 
     /**
-     * How many blocks {@link #elytraTakeoffPillar} will place before giving up on a spot. A hole
-     * deeper than this is more likely a shaft than a crevice, and each block placed costs a jump
-     * of its own, so there's a point past which pillaring out is slower than just admitting the
-     * spot is bad.
+     * How far {@link #elytraTakeoffPillar} will climb towards the height a takeoff would work from before
+     * deciding the spot isn't worth it. Not a guess at how high to go - the climb only ever aims at a measured
+     * height, and simply doesn't happen when that height is further than this - so raising it buys deeper
+     * crevices and nothing else. A hole deeper than this is more likely a shaft than a crevice, and each block
+     * costs a jump of its own, so past this it is cheaper to walk somewhere else and take off there.
      */
-    public final Setting<Integer> elytraTakeoffPillarMaxHeight = new Setting<>(4);
+    public final Setting<Integer> elytraTakeoffPillarMaxHeight = new Setting<>(12);
 
     /**
      * The seed used to generate chunks for long distance elytra path-finding in the nether.

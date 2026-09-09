@@ -442,24 +442,46 @@ public final class ElytraBehavior implements Helper {
         }
 
         /**
-         * One search in one context: with wide nodes first if asked, and when that comes back a stub and the
-         * adaptive setting is on, the same search again with fine nodes. A stub from the fine search is returned
-         * as it is; whether that means trying another context or flying it is the caller's business.
+         * One search in one context: with wide nodes first if asked, and when that comes back a stub - or
+         * doesn't come back at all - and the adaptive setting is on, the same search again with fine nodes. A
+         * stub from the fine search is returned as it is; whether that means trying another context or flying
+         * it is the caller's business.
+         * <p>
+         * The failure case matters as much as the stub. A wide search whose start sits in a node with any rock
+         * in it has no start node and returns nothing at all, which is the ordinary state of affairs for a
+         * takeoff out of a crevice or off the top of a fungus - and it used to propagate straight out to a
+         * caller that ended the flight over it, without the fine search that would have found a way ever
+         * being tried.
          */
         private CompletableFuture<PathSegment> searchIn(final NetherPathfinderContext where, final String label,
                                                        final BlockPos src, final BlockPos dst,
                                                        final boolean x4, final boolean adaptive) {
             return where.pathFindAsync(src, dst, x4)
-                    .thenCompose(segment -> {
+                    .handle((segment, ex) -> {
+                        if (ex != null) {
+                            final Throwable cause = unwrap(ex);
+                            if (x4 && adaptive && cause instanceof PathCalculationException) {
+                                logVerbose(String.format("path: %s x4 (failed: %s)", label, cause.getMessage()));
+                                return fineSearch(where, label, src, dst);
+                            }
+                            return CompletableFuture.<PathSegment>failedFuture(cause);
+                        }
                         logVerbose(String.format("path: %s x%d (finished=%b, %d nodes)", label, x4 ? 4 : 2, segment.finished, segment.packed.length));
                         if (x4 && adaptive && isStub(src, segment)) {
-                            return where.pathFindAsync(src, dst, false)
-                                    .thenApply(fine -> {
-                                        logVerbose(String.format("path: %s x2 (finished=%b, %d nodes)", label, fine.finished, fine.packed.length));
-                                        return fine;
-                                    });
+                            return fineSearch(where, label, src, dst);
                         }
                         return CompletableFuture.completedFuture(segment);
+                    })
+                    .thenCompose(Function.identity());
+        }
+
+        /** The same search with 2-block nodes, which fits through gaps and starts from places x4 cannot. */
+        private CompletableFuture<PathSegment> fineSearch(final NetherPathfinderContext where, final String label,
+                                                         final BlockPos src, final BlockPos dst) {
+            return where.pathFindAsync(src, dst, false)
+                    .thenApply(fine -> {
+                        logVerbose(String.format("path: %s x2 (finished=%b, %d nodes)", label, fine.finished, fine.packed.length));
+                        return fine;
                     });
         }
 
