@@ -172,6 +172,19 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      */
     private static final int TAKEOFF_SUCCESS_TICKS = 60;
     private static final int TAKEOFF_SUCCESS_DISTANCE = 32;
+    /**
+     * What the collision counter below has to reach to count as pinned rather than as a bump.
+     * <p>
+     * Three seconds of solid contact, or about four of the real thing once the counter's decay is paid for.
+     * An ordinary flight clips terrain about twice a minute and never twice running, while the two measured
+     * pins ran eight and sixteen seconds at roughly nine collisions in every ten ticks: there is a wide gap
+     * between the two, and nothing to gain from sitting closer to the noise.
+     */
+    private static final int TAKEOFF_PINNED_TICKS = 60;
+    /** How steeply a pinned glide is pointed down to put itself on the floor. Shallow enough not to dive. */
+    private static final float TAKEOFF_PINNED_SINK_PITCH = 40.0F;
+    /** How far below a pinned glide has to be clear of lava before it is allowed to set itself down. */
+    private static final int TAKEOFF_PINNED_SAFE_DROP = 12;
     /** How far we have to move for the ladder to consider itself at a new spot and start over from the top. */
     private static final int TAKEOFF_SAME_SPOT_RADIUS = 8;
     /** How long the ladder's memory of a spot survives with nothing happening. */
@@ -225,6 +238,10 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private int climbs;
     /** Consecutive ticks of gliding, to tell a flight from a takeoff that got off the ground and no further. */
     private int flyingTicks;
+    /** Airborne ticks spent in contact with something and not getting past it. See {@link #TAKEOFF_PINNED_TICKS}. */
+    private int pinnedTicks;
+    /** The path node the flight was nearest to last tick, to tell a pin from a squeeze that is still moving. */
+    private int lastNear;
     /**
      * The takeoff journal: how many flight ticks are still to be written, and what the launch was measured
      * and asked to be, so those ticks can be read against it.
@@ -427,6 +444,33 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             behavior.landingMode = this.state == State.LANDING;
             this.goal = null;
             baritone.getInputOverrideHandler().clearAllKeys();
+
+            // Pinned means both halves: flying into something, and not getting past it. Collision alone would
+            // also describe a bot squeezing along a tight corridor, which is unpleasant but is working.
+            //
+            // Decays rather than resets. A pin is not literally every tick - the two measured ones collided on
+            // 146 of 160 ticks and 299 of 320 - so a counter that a single free tick sent back to zero would
+            // never have fired on either of them. Falling four times as fast as it rises still empties in under
+            // a second of real flight, which is what keeps an ordinary clip of terrain from ever reaching it.
+            final int near = behavior.pathManager.getNear();
+            final boolean stuck = ctx.player().horizontalCollision && near <= this.lastNear;
+            this.lastNear = near;
+            this.pinnedTicks = stuck ? this.pinnedTicks + 1 : Math.max(0, this.pinnedTicks - 4);
+            if (this.pinnedTicks > TAKEOFF_PINNED_TICKS && groundBelowIsSafe()) {
+                // Flying, and going nowhere: the glide has been against a wall every tick for seconds. The
+                // solver cannot answer this - every pitch collides, so it reports no pitch solution, and that
+                // is the one branch of tick() that returns before it can light a firework. Left alone the bot
+                // scrapes until the terrain happens to let go; it did so for eight seconds and then sixteen
+                // in one flight. Stop fighting it: cut the thrust, point down, and take the landing, which is
+                // what hands control back to the takeoff ladder - the one thing here that can mine its way out.
+                if (this.pinnedTicks == TAKEOFF_PINNED_TICKS + 1) {
+                    logDirect("Flying into the same wall every tick and getting nowhere - setting down to try again from the ground.");
+                }
+                baritone.getLookBehavior().updateTarget(
+                        new Rotation(ctx.playerRotations().getYaw(), TAKEOFF_PINNED_SINK_PITCH), false);
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+            }
+
             behavior.tick();
             if (this.takeoffBoostPending) {
                 // a takeoff boost that couldn't be used the moment the elytra opened. after behavior.tick() so
@@ -448,6 +492,8 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         }
 
         this.flyingTicks = 0;
+        this.pinnedTicks = 0;
+        this.lastNear = 0;
 
         if (this.takeoffOpenedTicksAgo >= 0) {
             // we opened the elytra and it is shut again: on the ground that is a takeoff that didn't get
@@ -494,6 +540,18 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 final IMovement fall = executor.getPath().movements().stream()
                         .filter(movement -> movement instanceof MovementFall)
                         .findFirst().orElse(null);
+
+                if (fall != null && !fallIsFlyable(fall)) {
+                    // The ledge drops somewhere there is no flying out of. GoalDescendTo only ever asked to get
+                    // lower, so a shaft satisfies it as readily as a cliff does - it came back with a two-node
+                    // path, one eight-block drop on the spot, twice from the same block. What follows a jump
+                    // into one of those is not a takeoff: the elytra opens, the glide meets the wall, and
+                    // horizontalCollision takes the speed away again every tick, with no pitch solution, which
+                    // is the one state in which tick() returns before it can light a firework. Better to spend
+                    // the rung than the flight.
+                    logDirect("The only way down from here drops into somewhere I could not fly out of.");
+                    return standingTakeoff();
+                }
 
                 if (fall != null) {
                     final BetterBlockPos from = new BetterBlockPos(
@@ -1107,6 +1165,51 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     /** Room to stand, jump and open the elytra at {@code at}, and a way out of it. */
     private boolean canLaunchFrom(BlockPos at) {
         return launchRise(at) >= 0;
+    }
+
+    /**
+     * Whether there is somewhere to come down onto below us, and no lava in the way of getting there.
+     * <p>
+     * The pinned glide above gives up its altitude on purpose, so it has to know what it is giving it up
+     * over. Anything but a floor within {@link #TAKEOFF_PINNED_SAFE_DROP} - a lava pool, or open air all the
+     * way down - is a worse place to be than scraping a wall, and scraping does at least end on its own.
+     */
+    private boolean groundBelowIsSafe() {
+        final BetterBlockPos feet = ctx.playerFeet();
+        final BlockPos.MutableBlockPos mut = new BlockPos.MutableBlockPos();
+        for (int dy = 1; dy <= TAKEOFF_PINNED_SAFE_DROP; dy++) {
+            if (!isInBounds(mut.set(feet.x, feet.y - dy, feet.z))) {
+                return false;
+            }
+            final BlockState state = ctx.world().getBlockState(mut);
+            if (!state.getFluidState().isEmpty()) {
+                return false;
+            }
+            if (!MovementHelper.fullyPassable(ctx, mut)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether stepping off this ledge lands somewhere a glide can leave from.
+     * <p>
+     * {@link #takeoffGoal} asks {@link GoalDescendTo} for height and nothing else, so a shaft satisfies it
+     * exactly as well as a cliff: it came back with a two-node path, one drop of the minimum eight blocks on
+     * the spot, from a block whose own rim had just measured launchable. What the walk off buys in that case
+     * is a pocket with the elytra already open, and the glide spends the next half minute against its wall.
+     * <p>
+     * So the landing point has to pass the same test the standing spots do. A long drop is exempt: past
+     * {@link #TAKEOFF_MAX_LIFT} the glide has more height to leave in than the whole measurement covers, and
+     * refusing those would turn every dive down a canyon into a pillar.
+     */
+    private boolean fallIsFlyable(IMovement fall) {
+        final BetterBlockPos dest = fall.getDest();
+        if (fall.getSrc().y - dest.y >= TAKEOFF_MAX_LIFT) {
+            return true;
+        }
+        return canLaunchFrom(dest);
     }
 
     /**
