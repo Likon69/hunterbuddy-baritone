@@ -144,8 +144,34 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private static final int MAX_RELOCATIONS = 2;
     /** How many times it may climb, likewise. */
     private static final int MAX_CLIMBS = 2;
-    /** How far to walk towards the goal when even the relocation search has nothing to offer. */
+    /** How far the relocation search looks on its second, wider pass, and what that pass may spend. */
+    private static final int TAKEOFF_RELOCATE_RADIUS_WIDE = 32;
+    private static final int TAKEOFF_RELOCATE_COLUMN_BUDGET_WIDE = 1200;
+    /** How far to walk towards the goal when even the wide relocation search has nothing to offer. */
     private static final int TAKEOFF_WALK_ONWARDS = 48;
+    /**
+     * How long a rung that is walking or climbing may go without getting any closer to its goal before it is
+     * abandoned.
+     * <p>
+     * The other stall test asks whether anything is happening. That is the wrong question, and a flight was
+     * lost to it: a two-block pillar that could not be built had Baritone re-planning it successfully every
+     * six seconds, cancelling on its own movement timeout, and re-planning again - eighty-five seconds of
+     * loud, busy, motionless failure, with an executor present on every tick, so the stall counter was reset
+     * on every tick and never came near firing. Progress is the question.
+     */
+    private static final int TAKEOFF_NO_PROGRESS_TICKS = 200;
+    /**
+     * How long we have to stay in the air, or how far we have to get from where we jumped, before the takeoff
+     * counts as having worked and the ladder's memory of the spot is dropped.
+     * <p>
+     * Being airborne is not the same as having taken off. A jump that opens the elytra, scrapes the ceiling at
+     * two centimetres a tick and drops back in the hole is gliding by every test the game offers - and it used
+     * to wipe the attempt counters on its way past. The ladder could therefore never reach the rung that mines
+     * its way out, because every attempt erased the count of attempts. Ten identical launches from one block,
+     * twelve seconds apart, measured.
+     */
+    private static final int TAKEOFF_SUCCESS_TICKS = 60;
+    private static final int TAKEOFF_SUCCESS_DISTANCE = 32;
     /** How far we have to move for the ladder to consider itself at a new spot and start over from the top. */
     private static final int TAKEOFF_SAME_SPOT_RADIUS = 8;
     /** How long the ladder's memory of a spot survives with nothing happening. */
@@ -164,6 +190,14 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      * the server refused, which is worth telling the user apart from one that merely didn't get anywhere.
      */
     private int takeoffOpenedTicksAgo = -1;
+    /**
+     * How long after the elytra opens the takeoff path is left alone. The path a takeoff computes starts from
+     * a cube chosen so the first boost leaves along something clear; the obstacle pass, which recomputes from
+     * the player's feet, replaced it on the very first airborne tick of all five takeoffs in the flight this
+     * was measured on, three of them landing on the same cached node. Long enough to be clear of the launch
+     * site, short enough that a real obstacle a second later is still routed around.
+     */
+    private static final int TAKEOFF_PATH_GRACE_TICKS = 20;
     private boolean lavaPathRequested;
     /** Whether this takeoff sequence has already climbed once. One climb per spot: a stance that still fails after it is walled in some other way height can't fix. */
     private boolean pillared;
@@ -189,6 +223,36 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private int takeoffSpotTick;
     private int relocations;
     private int climbs;
+    /** Consecutive ticks of gliding, to tell a flight from a takeoff that got off the ground and no further. */
+    private int flyingTicks;
+    /**
+     * The takeoff journal: how many flight ticks are still to be written, and what the launch was measured
+     * and asked to be, so those ticks can be read against it.
+     * <p>
+     * It exists to separate two explanations of the same event, which no amount of reading the code has
+     * separated: a takeoff from a spot {@link #launchRise} measured as clear that flies into terrain anyway.
+     * Either the measurement is wrong - it casts one line and the player is a body 0.6 wide - or the elytra
+     * path computed from the exit cube is replaced, on the first airborne tick, by one recomputed from the
+     * player's feet, which is what the solver then aims the rocket down. The first shows up as a takeoff that
+     * follows its own first node into rock; the second as that first node changing between the tick the
+     * elytra opens and the one after.
+     */
+    private int takeoffLogTicks;
+    private BetterBlockPos takeoffLogFrom;
+    private BetterBlockPos takeoffLogStart;
+    private boolean takeoffLogStartWasCube;
+    private int takeoffLogLift;
+    private int takeoffLogRise;
+    private String takeoffLogNode = "";
+
+    /** The best (least) goal heuristic reached since the current rung started, and when it was reached. */
+    private double takeoffProgressBest;
+    private int takeoffProgressTick;
+
+    /** One tick's worth of {@link #liftHeight}, which is walked several times per tick while stuck. */
+    private BetterBlockPos liftCacheAt;
+    private int liftCacheTick = -1;
+    private int liftCacheValue = -1;
 
     @Override
     public void onLostControl() {
@@ -341,9 +405,14 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         }
 
         if (ctx.player().isFallFlying()) {
-            // We are in the air: whatever the ladder was working through is answered, and the next takeoff -
-            // wherever and whenever it happens - starts from the top again.
-            forgetTakeoffSpot();
+            // Airborne, but not necessarily away: only a flight that lasts, or that gets us clear of where we
+            // jumped from, answers what the ladder was working through.
+            this.flyingTicks++;
+            final boolean clear = this.takeoffSpot == null
+                    || this.takeoffSpot.distanceSq(ctx.playerFeet()) > TAKEOFF_SUCCESS_DISTANCE * TAKEOFF_SUCCESS_DISTANCE;
+            if (this.flyingTicks > TAKEOFF_SUCCESS_TICKS || clear) {
+                forgetTakeoffSpot();
+            }
             if (this.state == State.TAKEOFF_JUMP) {
                 // the elytra opened without us having asked for it, pick up from wherever that leaves us
                 this.state = State.START_FLYING;
@@ -354,6 +423,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             if (this.takeoffOpenedTicksAgo >= 0) {
                 this.takeoffOpenedTicksAgo++;
             }
+            writeTakeoffJournal();
             behavior.landingMode = this.state == State.LANDING;
             this.goal = null;
             baritone.getInputOverrideHandler().clearAllKeys();
@@ -376,6 +446,8 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             this.onLostControl();
             return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
         }
+
+        this.flyingTicks = 0;
 
         if (this.takeoffOpenedTicksAgo >= 0) {
             // we opened the elytra and it is shut again: on the ground that is a takeoff that didn't get
@@ -429,7 +501,13 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                             (fall.getSrc().y + fall.getDest().y) / 2,
                             (fall.getSrc().z + fall.getDest().z) / 2
                     );
+                    final ElytraBehavior owner = this.behavior;
                     behavior.pathManager.pathToDestination(from).whenComplete((result, ex) -> {
+                        if (this.behavior != owner) {
+                            // torn down and rebuilt while we were computing (a cancel, a new destination, a
+                            // seed change). Writing state now would drive the new behavior off the old path.
+                            return;
+                        }
                         if (ex == null) {
                             this.state = State.GET_TO_JUMP;
                             return;
@@ -527,7 +605,15 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 this.goal = null;
                 this.takeoffStage = Stage.LAUNCH;
                 this.standingTakeoffs = 0;
-                return standingTakeoff();
+                // Through LOCATE_JUMP rather than straight into standingTakeoff, the same way the walk does:
+                // we are on top of the rim now, and a ledge to step off is still the cheapest takeoff there is
+                // and the one most likely to work. standingTakeoff sets walkOffImpossible itself, so calling it
+                // here would skip that search for good.
+                this.walkOffImpossible = false;
+                this.walkOffAttempts = 0;
+                this.takeoffStallTicks = 0;
+                this.state = State.LOCATE_JUMP;
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
             }
 
             final IPathExecutor executor = baritone.getPathingBehavior().getCurrent();
@@ -536,6 +622,12 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             } else if (++this.takeoffStallTicks > TAKEOFF_STALL_TICKS) {
                 // Stalled climbing (ran out of blocks mid-pillar, obstruction) -- the height we wanted isn't
                 // reachable from here, so stop asking for it and go look somewhere else.
+                this.goal = null;
+                this.takeoffStage = Stage.RELOCATE;
+                return standingTakeoff();
+            }
+            if (takeoffNoProgress()) {
+                logDirect("The climb is going nowhere, looking for somewhere else to take off from.");
                 this.goal = null;
                 this.takeoffStage = Stage.RELOCATE;
                 return standingTakeoff();
@@ -561,6 +653,12 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             if (executor != null || baritone.getPathingBehavior().getInProgress().isPresent()) {
                 this.takeoffStallTicks = 0;
             } else if (++this.takeoffStallTicks > TAKEOFF_STALL_TICKS) {
+                this.goal = null;
+                this.takeoffStage = Stage.EXHAUSTED;
+                return standingTakeoff();
+            }
+            if (takeoffNoProgress()) {
+                logDirect("Not getting any closer to a spot to take off from, giving up on the walk.");
                 this.goal = null;
                 this.takeoffStage = Stage.EXHAUSTED;
                 return standingTakeoff();
@@ -617,7 +715,29 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         // How far above our feet a takeoff would have somewhere to go. 0 means right here; a positive number
         // means we are in a crevice or a hole whose rim is that far up; -1 means nothing within reach of a
         // climb, which is a pocket or a cave and only a walk can answer.
-        final int lift = liftHeight(feet);
+        int lift = liftHeight(feet);
+        if (lift == 0 && takeoffExit(feet) == null) {
+            // launchRise is happy - there is room to jump and a clear line towards the goal - but there is no
+            // node cube for the flight path to start in, and the cube is what the solver aims the first boost
+            // at. The two measure different things and they disagree here by as much as 24 blocks. Prefer
+            // climbing to where they agree.
+            final int climb = liftToNodeCube(feet);
+            if (climb > 0) {
+                lift = climb;
+            } else {
+                // No height above us satisfies both, which is what a shaft looks like: launchRise threads a
+                // single ray out through the opening at the steepest rise it has, no 4x4x4 cube ever fits in
+                // the width, and every height fails the same 16-block line. Launching anyway is what the bot
+                // did ten times in a row from y=32 at 6235180 2680864 - rise=10, column fallback, back on the
+                // ground four seconds later - because a ray is not a body and the rocket is spent along the
+                // path, which starts 29 blocks straight up. Climb the shaft instead: the ordinary context is
+                // allowed to pillar and mine, and the rim is where the ray finally means something.
+                final int out = climbableColumn(feet);
+                if (out > 0) {
+                    lift = out;
+                }
+            }
+        }
 
         if (this.takeoffStage == Stage.LAUNCH) {
             if (lift == 0 && this.standingTakeoffs < MAX_STANDING_TAKEOFFS) {
@@ -659,10 +779,27 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         // and the takeoff rocket is spent along that aim, so a path that starts inside the hole we are trying
         // to leave points the boost straight back into its wall.
         final BetterBlockPos start = launchPathStart(feet);
+        if (Baritone.settings().elytraTakeoffJournal.value) {
+            final BetterBlockPos cube = takeoffExit(feet);
+            this.takeoffLogFrom = feet;
+            this.takeoffLogStart = start;
+            this.takeoffLogStartWasCube = cube != null;
+            this.takeoffLogLift = liftHeight(feet);
+            this.takeoffLogRise = launchRise(feet);
+            this.takeoffLogNode = "";
+            logDirect(String.format(Locale.ROOT,
+                    "takeoff: from %d %d %d, lift=%d rise=%d, path starts at %d %d %d (%s)",
+                    feet.x, feet.y, feet.z, this.takeoffLogLift, this.takeoffLogRise,
+                    start.x, start.y, start.z, this.takeoffLogStartWasCube ? "node cube" : "column fallback"));
+        }
         // the elytra path has to exist before we leave the ground: the behavior does nothing without one, and the
         // handful of ticks between opening the elytra and hitting the ground is no time to compute one
         this.state = State.PAUSE;
+        final ElytraBehavior owner = this.behavior;
         this.behavior.pathManager.pathToDestination(start).whenComplete((result, ex) -> {
+            if (this.behavior != owner) {
+                return;
+            }
             if (ex == null) {
                 this.state = State.TAKEOFF_JUMP;
                 return;
@@ -706,6 +843,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         this.goal = new GoalBlock(feet.x, this.pillarTargetY, feet.z);
         this.state = State.PILLAR_UP;
         this.takeoffStallTicks = 0;
+        takeoffProgressReset();
         logDirect("Nothing to take off into from here, climbing " + lift + " blocks to where there is.");
         return new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH);
     }
@@ -720,15 +858,26 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         if (this.relocations >= MAX_RELOCATIONS) {
             return null;
         }
-        final List<Goal> spots = findLaunchSpots(feet);
+        // Near first, and only then wide: the wide sweep costs a few tens of thousands of block reads, which
+        // is worth paying once we are otherwise out of ideas and not before.
+        List<Goal> spots = findLaunchSpots(feet, TAKEOFF_RELOCATE_RADIUS, TAKEOFF_RELOCATE_COLUMN_BUDGET);
+        if (spots.isEmpty()) {
+            spots = findLaunchSpots(feet, TAKEOFF_RELOCATE_RADIUS_WIDE, TAKEOFF_RELOCATE_COLUMN_BUDGET_WIDE);
+        }
         final String what;
         if (!spots.isEmpty()) {
             this.goal = new GoalComposite(spots.toArray(new Goal[0]));
-            what = "walking to one of " + spots.size() + " spots nearby that will work";
+            what = "walking to one of " + spots.size() + " spots that will work";
         } else {
-            // Nothing within range measures as launchable, which in a cave system is perfectly possible. Set
-            // off towards the destination on foot instead and ask again from there: it is the one direction
-            // where walking is not wasted even if it takes a while to find sky.
+            // Nothing measured as launchable anywhere in range, which in a cave system is perfectly possible.
+            // Set off towards the destination on foot and ask again from there.
+            //
+            // This is the crude rung and it looks it: the goal is a compass direction rather than a place, so
+            // the pathfinder satisfies it however it can, digging and bridging, sometimes spending a second of
+            // its own thread on a segment worth a few blocks. It was removed once for exactly that reason and
+            // the removal was wrong - in the one flight where it fired, it walked the bot out of a pocket at
+            // y=103 and had it airborne again half a minute later, for five thousand more blocks. Crude and
+            // working beats tidy and stuck.
             final Goal onwards = walkOnwardsGoal(feet);
             if (onwards == null) {
                 return null;
@@ -739,6 +888,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         this.relocations++;
         this.state = State.WALK_TO_LAUNCH;
         this.takeoffStallTicks = 0;
+        takeoffProgressReset();
         logDirect("Nowhere to take off from here, " + what + ".");
         return new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH);
     }
@@ -783,29 +933,102 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         this.state = State.LOCATE_JUMP;
     }
 
-    /** Starts the ladder over when {@code feet} is somewhere other than where it was last run. */
+    /**
+     * Starts the ladder over when {@code feet} is somewhere other than where it was last run, or when it has
+     * been working the same spot long enough that the terrain around it is worth re-reading.
+     * <p>
+     * Horizontal distance only, and the clock is stamped when the spot changes rather than on every call.
+     * Both matter: measuring in three dimensions made a climb read as a new spot and cleared the one-climb
+     * rule with it, and re-stamping every tick - which is every tick, since this runs from the state that
+     * loops - meant the expiry could never elapse and a spot that reached the end of the ladder stayed there
+     * for the rest of the session.
+     */
     private void rememberTakeoffSpot(BetterBlockPos feet) {
         final int now = ctx.player().tickCount;
+        final int dx = this.takeoffSpot == null ? 0 : this.takeoffSpot.x - feet.x;
+        final int dz = this.takeoffSpot == null ? 0 : this.takeoffSpot.z - feet.z;
         final boolean sameSpot = this.takeoffSpot != null
-                && this.takeoffSpot.distanceSq(feet) <= TAKEOFF_SAME_SPOT_RADIUS * TAKEOFF_SAME_SPOT_RADIUS
+                && dx * dx + dz * dz <= TAKEOFF_SAME_SPOT_RADIUS * TAKEOFF_SAME_SPOT_RADIUS
                 && now - this.takeoffSpotTick < TAKEOFF_MEMORY_TICKS;
-        if (!sameSpot) {
-            this.takeoffStage = Stage.LAUNCH;
-            this.standingTakeoffs = 0;
-            this.pillared = false;
+        if (sameSpot) {
+            return;
         }
+        this.takeoffStage = Stage.LAUNCH;
+        this.standingTakeoffs = 0;
+        this.pillared = false;
         this.takeoffSpot = feet;
         this.takeoffSpotTick = now;
+    }
+
+    /**
+     * One line per flight tick for the first few ticks after the elytra opens, while the journal is armed.
+     * <p>
+     * The line that matters is the path's first node: it is what the solver aims at and therefore where the
+     * takeoff rocket is spent. If it stays the node cube the launch asked for, the path survived and a
+     * collision means the runway measurement was wrong. If it changes to something at the player's feet, the
+     * path was recomputed underneath the takeoff and the measurement is not on trial at all.
+     */
+    private void writeTakeoffJournal() {
+        if (this.takeoffLogTicks <= 0) {
+            return;
+        }
+        this.takeoffLogTicks--;
+        final java.util.List<BetterBlockPos> path = this.behavior.pathManager.getPath();
+        final String node = path.isEmpty() ? "none" : path.get(0).x + " " + path.get(0).y + " " + path.get(0).z;
+        final boolean changed = !node.equals(this.takeoffLogNode);
+        this.takeoffLogNode = node;
+        final Vec3 pos = ctx.player().position();
+        final Vec3 motion = ctx.player().getDeltaMovement();
+        logDirect(String.format(Locale.ROOT,
+                "takeoff+%d: at %.1f %.1f %.1f, speed %.2f, node0 %s%s (%d nodes)%s%s",
+                Baritone.settings().elytraTakeoffJournalTicks.value - this.takeoffLogTicks,
+                pos.x, pos.y, pos.z, motion.length(), node, changed ? " CHANGED" : "", path.size(),
+                ctx.player().horizontalCollision ? " hbonk" : "",
+                ctx.player().verticalCollision ? " vbonk" : ""));
     }
 
     /** Drops the ladder's memory of a spot entirely - we are flying, so whatever it was working on is moot. */
     private void forgetTakeoffSpot() {
         this.takeoffSpot = null;
         this.takeoffStage = Stage.LAUNCH;
+        // the journal belongs to the takeoff, not to the flight; it stops itself after its own ticks
         this.relocations = 0;
         this.climbs = 0;
         this.standingTakeoffs = 0;
         this.pillared = false;
+        // "No ledge to walk off" was a fact about the spot we took off from, not about wherever we land
+        // next. Left set, it made every landing after a standing takeoff skip the ledge search outright and
+        // go straight down the ladder - to a walk, or to the crude last rung - when a ledge was there to be
+        // found in a few dozen milliseconds the moment something did reset it.
+        this.walkOffImpossible = false;
+    }
+
+    /**
+     * Whether the rung in progress has stopped getting closer to its goal for long enough to give up on it.
+     * <p>
+     * Distance to the goal rather than any sign of activity: a path being re-planned over and over is
+     * activity, and it is exactly the shape of failure this exists to catch. {@link Goal#heuristic} is the
+     * one measure every goal here can be asked for, whether it is a block above us or a composite of eight
+     * landing spots.
+     */
+    private boolean takeoffNoProgress() {
+        if (this.goal == null) {
+            return false;
+        }
+        final BetterBlockPos feet = ctx.playerFeet();
+        final double now = this.goal.heuristic(feet.x, feet.y, feet.z);
+        if (now < this.takeoffProgressBest - 0.01) {
+            this.takeoffProgressBest = now;
+            this.takeoffProgressTick = ctx.player().tickCount;
+            return false;
+        }
+        return ctx.player().tickCount - this.takeoffProgressTick > TAKEOFF_NO_PROGRESS_TICKS;
+    }
+
+    /** Restarts the progress clock, for a rung that has just been given a goal. */
+    private void takeoffProgressReset() {
+        this.takeoffProgressBest = Double.POSITIVE_INFINITY;
+        this.takeoffProgressTick = ctx.player().tickCount;
     }
 
     /**
@@ -819,32 +1042,89 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      * boulder two blocks away read as walled in.
      */
     private int liftHeight(BetterBlockPos feet) {
-        final int max = Math.min(TAKEOFF_MAX_LIFT, 126 - feet.y);
+        if (this.liftCacheTick == ctx.player().tickCount && feet.equals(this.liftCacheAt)) {
+            // standingTakeoff runs every tick while we are stuck, and this walks a few thousand blocks
+            return this.liftCacheValue;
+        }
+        // Where we stand is always worth testing, whatever the roof is doing: clamping the search to the
+        // pathfinder's ceiling used to make this loop skip h=0 entirely for anyone standing near it, which
+        // reported a perfectly good launch spot as a sealed pocket.
+        final int max = Math.max(0, Math.min(TAKEOFF_MAX_LIFT, 126 - feet.y));
+        int found = -1;
         for (int h = 0; h <= max; h++) {
             if (canLaunchFrom(feet.above(h))) {
+                found = h;
+                break;
+            }
+        }
+        this.liftCacheTick = ctx.player().tickCount;
+        this.liftCacheAt = feet;
+        this.liftCacheValue = found;
+        return found;
+    }
+
+    /**
+     * How far up the column the first position sits from which {@link #takeoffExit} can find a node cube, or
+     * {@code 0} if there is none within {@link #TAKEOFF_MAX_LIFT}.
+     */
+    /**
+     * How far the open column straight above {@code feet} can be climbed, or {@code 0} when there is not
+     * enough of it to be worth a pillar.
+     * <p>
+     * The last resort of {@link #standingTakeoff} when nothing above measures as launchable: it does not ask
+     * whether the top is a good takeoff, only whether it is somewhere else. In a shaft that is the whole
+     * point - the measurements that keep approving the floor all fail the same way for the same reason, and
+     * the one thing that changes any of them is height. Capped at what {@link #climbToLaunch} will accept, so
+     * the rung it is meant to trigger does not refuse it on arrival.
+     */
+    private int climbableColumn(BetterBlockPos feet) {
+        final int max = Math.min(
+                Math.max(0, Math.min(TAKEOFF_MAX_LIFT, 126 - feet.y)),
+                Baritone.settings().elytraTakeoffPillarMaxHeight.value
+        );
+        int h = 0;
+        while (h < max && MovementHelper.fullyPassable(ctx, feet.above(h + 1))) {
+            h++;
+        }
+        // Four blocks is the room a takeoff needs to stand and open in anyway; anything less is a ceiling, not
+        // a shaft, and pillaring into it would only spend the climb the ladder has left.
+        return h >= 4 ? h : 0;
+    }
+
+    private int liftToNodeCube(BetterBlockPos feet) {
+        final int max = Math.max(0, Math.min(TAKEOFF_MAX_LIFT, 126 - feet.y));
+        for (int h = 1; h <= max; h++) {
+            if (!MovementHelper.fullyPassable(ctx, feet.above(h))) {
+                return 0;
+            }
+            if (canLaunchFrom(feet.above(h)) && takeoffExit(feet.above(h)) != null) {
                 return h;
             }
         }
-        return -1;
+        return 0;
     }
 
     /** Room to stand, jump and open the elytra at {@code at}, and a way out of it. */
     private boolean canLaunchFrom(BlockPos at) {
-        for (int dy = 0; dy <= 3; dy++) {
-            if (!MovementHelper.fullyPassable(ctx, at.above(dy))) {
-                return false;
-            }
-        }
-        return launchLineClear(at);
+        return launchRise(at) >= 0;
     }
 
     /**
-     * Whether a rocket lit at {@code at} has {@link #TAKEOFF_RUNWAY} blocks of nothing in front of it, along
-     * the bearing to the destination, at any of {@link #TAKEOFF_RUNWAY_RISES}. Several rises because the two
-     * things that block a takeoff want opposite answers: a crevice needs a steep line to clear its rim, and
-     * the nether ceiling refuses one.
+     * The shallowest of {@link #TAKEOFF_RUNWAY_RISES} at which a rocket lit at {@code at} has
+     * {@link #TAKEOFF_RUNWAY} blocks of nothing in front of it along the bearing to the destination, or
+     * {@code -1} if there is no room to stand and jump here or every rise is blocked.
+     * <p>
+     * Several rises because the two things that block a takeoff want opposite answers: a crevice needs a
+     * steep line to clear its rim, and the nether ceiling refuses one. Which one passed is the caller's
+     * business too - it is the angle the jump then has to be aimed at, and approving a flat tunnel and
+     * launching steeply into its roof is not a takeoff.
      */
-    private boolean launchLineClear(BlockPos at) {
+    private int launchRise(BlockPos at) {
+        for (int dy = 0; dy <= 3; dy++) {
+            if (!MovementHelper.fullyPassable(ctx, at.above(dy))) {
+                return -1;
+            }
+        }
         final Vec3 from = Vec3.atCenterOf(at).add(0, 1.0, 0);
         double dx = 0;
         double dz = 0;
@@ -865,10 +1145,10 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         }
         for (int rise : TAKEOFF_RUNWAY_RISES) {
             if (rayPassable(from, from.add(dx, rise, dz))) {
-                return true;
+                return rise;
             }
         }
-        return false;
+        return -1;
     }
 
     /** Whether every block the segment passes through is passable, sampled twice a block. */
@@ -888,17 +1168,17 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
     /**
      * Up to {@link #TAKEOFF_RELOCATE_SPOTS} goals, nearest first, on standable ground within
-     * {@link #TAKEOFF_RELOCATE_RADIUS} that {@link #canLaunchFrom} accepts. One surface per column - the
+     * {@code radius} that {@link #canLaunchFrom} accepts. One surface per column - the
      * highest one, which out of a hole is its rim - so the scan stays a few thousand block reads.
      */
-    private List<Goal> findLaunchSpots(BetterBlockPos feet) {
+    private List<Goal> findLaunchSpots(BetterBlockPos feet, int radius, int columnBudget) {
         final List<int[]> columns = new ArrayList<>();
-        for (int dx = -TAKEOFF_RELOCATE_RADIUS; dx <= TAKEOFF_RELOCATE_RADIUS; dx++) {
-            for (int dz = -TAKEOFF_RELOCATE_RADIUS; dz <= TAKEOFF_RELOCATE_RADIUS; dz++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
                 final int d = dx * dx + dz * dz;
                 // Anything closer than the ladder's own idea of "the same spot" would be walked to and then
                 // treated as the place that just failed, so the walk would buy nothing.
-                if (d > TAKEOFF_RELOCATE_RADIUS * TAKEOFF_RELOCATE_RADIUS
+                if (d > radius * radius
                         || d <= TAKEOFF_SAME_SPOT_RADIUS * TAKEOFF_SAME_SPOT_RADIUS) {
                     continue;
                 }
@@ -908,16 +1188,30 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         columns.sort(Comparator.comparingInt(c -> c[0]));
 
         final List<Goal> spots = new ArrayList<>();
+        final List<Goal> lower = new ArrayList<>();
         int examined = 0;
         for (int[] column : columns) {
-            if (spots.size() >= TAKEOFF_RELOCATE_SPOTS || examined >= TAKEOFF_RELOCATE_COLUMN_BUDGET) {
+            if (spots.size() >= TAKEOFF_RELOCATE_SPOTS || examined >= columnBudget) {
                 break;
             }
             examined++;
             final BetterBlockPos surface = highestFloor(feet.x + column[1], feet.z + column[2], feet.y);
-            if (surface != null && canLaunchFrom(surface)) {
-                spots.add(new GoalBlock(surface.x, surface.y, surface.z));
+            if (surface == null || !canLaunchFrom(surface)) {
+                continue;
             }
+            if (surface.y >= feet.y) {
+                spots.add(new GoalBlock(surface.x, surface.y, surface.z));
+            } else {
+                lower.add(new GoalBlock(surface.x, surface.y, surface.z));
+            }
+        }
+        // Downhill only when there is nothing else at all, and never alongside something better. Ordering the
+        // list was useless: these go into a GoalComposite, which has no order - the pathfinder simply
+        // satisfies whichever goal is cheapest to reach, and downhill is nearly always the cheapest. That is
+        // how a bot stuck in a hole walked thirteen blocks out of it and then straight back in, ten times in
+        // a row, because the hole was still one of the six goals it had been handed.
+        if (spots.isEmpty()) {
+            return lower;
         }
         return spots;
     }
@@ -940,7 +1234,12 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         return null;
     }
 
-    /** Where the look is held through a takeoff jump: the bearing to the destination, tilted up. */
+    /**
+     * Where the look is held through a takeoff jump: the bearing to the destination, tilted up along the
+     * runway that was actually measured clear. A fixed angle would be a different line from the one
+     * {@link #launchRise} approved - steeper than a flat tunnel it just passed, shallower than the rim of a
+     * crevice it just cleared - and the rocket is spent along the line we point at, not the one we checked.
+     */
     private Rotation takeoffAim() {
         final BetterBlockPos dest = this.behavior != null ? this.behavior.destination : null;
         if (dest == null) {
@@ -951,8 +1250,12 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         if (from.distanceToSqr(to) < 1) {
             return null;
         }
+        final int rise = launchRise(ctx.playerFeet());
+        final float pitch = rise < 0
+                ? TAKEOFF_PITCH
+                : (float) -Math.toDegrees(Math.atan2(rise, TAKEOFF_RUNWAY));
         final Rotation bearing = RotationUtils.calcRotationFromVec3d(from, to, ctx.playerRotations());
-        return new Rotation(bearing.getYaw(), TAKEOFF_PITCH);
+        return new Rotation(bearing.getYaw(), pitch);
     }
 
     /**
@@ -1081,6 +1384,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         // has not decided yet. The tick costs nothing: the rocket takes a round trip to show up regardless.
         this.takeoffBoostPending = true;
         this.takeoffOpenedTicksAgo = 0;
+        if (Baritone.settings().elytraTakeoffJournal.value) {
+            this.takeoffLogTicks = Baritone.settings().elytraTakeoffJournalTicks.value;
+        }
         return true;
     }
 
@@ -1308,6 +1614,14 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             return true;
         }
         return false;
+    }
+
+    /**
+     * Whether a takeoff opened its elytra recently enough that its flight path should not be recomputed yet.
+     * Read by {@link ElytraBehavior}'s obstacle pass, which otherwise throws that path away immediately.
+     */
+    public boolean inTakeoffGrace() {
+        return this.takeoffOpenedTicksAgo >= 0 && this.takeoffOpenedTicksAgo < TAKEOFF_PATH_GRACE_TICKS;
     }
 
     @Override
