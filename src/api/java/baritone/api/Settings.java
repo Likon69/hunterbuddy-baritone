@@ -1543,11 +1543,71 @@ public final class Settings {
     public final Setting<Integer> elytraPathNodeSize = new Setting<>(4);
 
     /**
+     * The firework acceleration the flight simulation assumes, where vanilla uses {@code 1.5}.
+     * <p>
+     * The solver picks its pitch by simulating the boosted trajectory forward and raytracing it against the
+     * terrain, so this constant is what decides which pitches are considered safe. A client that boosts harder
+     * than vanilla - a firework speed multiplier, for instance - flies a faster and flatter trajectory than the
+     * one that was checked, and ends up in blocks the check never looked at. Meant to be set by whatever mod
+     * changes the constant client side, so the two agree; leave it at vanilla otherwise.
+     * <p>
+     * There is no safe side to round this to. Simulating faster than the client flies clears a wall ahead but
+     * flies over ground the real, slower trajectory drops into; simulating slower does the reverse. It wants
+     * the number actually in force.
+     * <p>
+     * Ordinarily driven by whatever mod changes the constant, which sets it on and hands back 1.5 off. It is
+     * visible and settable so that state can be seen and corrected: a client that crashed mid-flight leaves
+     * it wherever it was, and Baritone would then plan for a boost nothing is applying. If Baritone is flying
+     * into terrain for no apparent reason, this is the first thing to read back.
+     */
+    public final Setting<Double> elytraFireworkBoostMultiplier = new Setting<>(1.5D);
+
+    /**
+     * How many ticks longer than vanilla a firework keeps pushing, for mods that hold a rocket alive past the
+     * lifetime the server gave it.
+     * <p>
+     * The multiplier above is only half of what such a mod changes. The solver also decides <i>how many</i>
+     * boosted ticks to simulate, from the rocket entity's age against its lifetime: once that runs out it
+     * plans a short, mostly unboosted trajectory and picks a flat pitch for it - while the client is still
+     * accelerating. Same failure as a wrong multiplier, on the other axis, and visible and settable for the
+     * same reason.
+     */
+    public final Setting<Integer> elytraFireworkExtraBoostTicks = new Setting<>(0);
+
+    /**
      * Search with 4-block nodes first and, when that only produces a stub (an unfinished path that ends within
      * 64 blocks of where it started, meaning the search was boxed in), search again with 2-block nodes. Keeps
      * the fast wide search for the common case and only pays for the fine one where a gap needs it.
      */
     public final Setting<Boolean> elytraPathNodeAdaptive = new Setting<>(true);
+
+    /**
+     * How far a 4-block-node path may wander before {@link #elytraPathNodeAdaptive} tries the fine search on
+     * it, as a multiple of the straight line to where that path ended up. {@code 1.0} would be a perfectly
+     * direct route; {@code 2.0} means it flew twice as far as it got.
+     * <p>
+     * The stub test only catches a wide search that got nowhere. A wide search that succeeds by going the long
+     * way round - which is what it does wherever the only opening is narrower than four blocks - is a finished
+     * path, and nothing used to question it. The fine result is kept only when it is actually straighter, so
+     * the wide search still wins the common case. Raise this to question fewer paths, lower it to question
+     * more, at the price of a second search each time.
+     */
+    public final Setting<Double> elytraPathDetourRatio = new Setting<>(1.6D);
+
+    /**
+     * Write a line per tick for the first moments of every takeoff: what the launch spot measured, where the
+     * flight path was asked to start, and then, tick by tick, where the path's first node actually is.
+     * <p>
+     * That first node is what the solver aims at and where the takeoff rocket is spent. A takeoff that hits
+     * terrain from a spot measured as clear has two possible explanations and they are told apart here: the
+     * node stays where the launch put it (so the measurement was wrong), or it moves to the player's feet (so
+     * the path was recomputed underneath the takeoff). Off by default; it is noisy and only useful while
+     * chasing exactly that.
+     */
+    public final Setting<Boolean> elytraTakeoffJournal = new Setting<>(false);
+
+    /** How many flight ticks {@link #elytraTakeoffJournal} writes after the elytra opens. */
+    public final Setting<Integer> elytraTakeoffJournalTicks = new Setting<>(40);
 
     /**
      * Honour a path corridor pushed by another mod (a set of chunks the path is allowed to use, for instance a

@@ -467,8 +467,37 @@ public final class ElytraBehavior implements Helper {
                             return CompletableFuture.<PathSegment>failedFuture(cause);
                         }
                         logVerbose(String.format("path: %s x%d (finished=%b, %d nodes)", label, x4 ? 4 : 2, segment.finished, segment.packed.length));
-                        if (x4 && adaptive && isStub(src, segment)) {
-                            return fineSearch(where, label, src, dst);
+                        if (x4 && adaptive) {
+                            if (isStub(src, segment)) {
+                                return fineSearch(where, label, src, dst);
+                            }
+                            final double wide = detourRatio(src, segment);
+                            if (wide > Baritone.settings().elytraPathDetourRatio.value) {
+                                logVerbose(String.format("path: %s x4 wanders (%.2fx the straight line), trying x2", label, wide));
+                                return fineSearch(where, label, src, dst).thenApply(fine -> {
+                                    // Only take the fine path if it really is the straighter one. The wide
+                                    // search is the fast one and flies better, so it keeps the segment unless
+                                    // the gap it routed around turns out to be worth threading.
+                                    //
+                                    // "Straighter" has to mean the same journey. A fine search that gave up
+                                    // early has a small ratio for having gone nowhere, and detourRatio's 0 for
+                                    // "too short to judge" is smaller than anything: both used to win against
+                                    // a wide path that actually reached the rejoin node (28 of 275 swaps in
+                                    // the 16:35 flight), which put a stub in place of a finished segment.
+                                    final double narrow = detourRatio(src, fine);
+                                    final boolean comparable = narrow > 0
+                                            && !isStub(src, fine)
+                                            && (fine.finished || !segment.finished)
+                                            // two unfinished searches measure two different journeys; the
+                                            // fine one only counts if it got at least as close to the target
+                                            && (fine.finished || lastNodeDistSq(fine, dst) <= lastNodeDistSq(segment, dst));
+                                    if (comparable && narrow < wide) {
+                                        logVerbose(String.format("path: %s x2 is straighter (%.2fx), taking it", label, narrow));
+                                        return fine;
+                                    }
+                                    return segment;
+                                });
+                            }
                         }
                         return CompletableFuture.completedFuture(segment);
                     })
@@ -483,6 +512,50 @@ public final class ElytraBehavior implements Helper {
                         logVerbose(String.format("path: %s x2 (finished=%b, %d nodes)", label, fine.finished, fine.packed.length));
                         return fine;
                     });
+        }
+
+        /**
+         * How far the segment travels for every block of progress it makes, as a multiple: {@code 1.0} is a
+         * straight line to where it ended up, {@code 2.0} means it flew twice as far as it got.
+         * <p>
+         * This is what tells a detour from a route. With 4-block nodes the search only goes through openings
+         * four blocks wide, so it routes around anything narrower - around a whole massif, sometimes, where a
+         * gliding player would have slipped through the crevice. That is a <i>successful, finished</i> search,
+         * so the stub test above never sees it and the fine search that would have found the gap never runs.
+         * {@code 0} for a segment too short to judge: near the start every path wanders a little, and paying
+         * for a second search over it would double the cost of the common case for nothing.
+         */
+        private static double detourRatio(final BlockPos src, final PathSegment segment) {
+            if (segment.packed.length < 4) {
+                return 0;
+            }
+            double travelled = 0;
+            BetterBlockPos previous = BetterBlockPos.deserializeFromLong(segment.packed[0]);
+            for (int i = 1; i < segment.packed.length; i++) {
+                final BetterBlockPos node = BetterBlockPos.deserializeFromLong(segment.packed[i]);
+                travelled += previous.distanceTo(node);
+                previous = node;
+            }
+            final double dx = previous.x - src.getX();
+            final double dy = previous.y - src.getY();
+            final double dz = previous.z - src.getZ();
+            final double straight = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (straight < 64) {
+                return 0;
+            }
+            return travelled / straight;
+        }
+
+        /** Squared distance from the segment's last node to {@code target}; infinite for an empty segment. */
+        private static double lastNodeDistSq(final PathSegment segment, final BlockPos target) {
+            if (segment.packed.length == 0) {
+                return Double.POSITIVE_INFINITY;
+            }
+            final BetterBlockPos last = BetterBlockPos.deserializeFromLong(segment.packed[segment.packed.length - 1]);
+            final double dx = last.x - target.getX();
+            final double dy = last.y - target.getY();
+            final double dz = last.z - target.getZ();
+            return dx * dx + dy * dy + dz * dz;
         }
 
         /**
@@ -519,6 +592,36 @@ public final class ElytraBehavior implements Helper {
 
         private void pathfindAroundObstacles() {
             if (this.recalculating) {
+                return;
+            }
+
+            if (!ctx.player().isFallFlying()) {
+                // On the ground the path is not being flown, and every path we have there was computed on
+                // purpose by a takeoff state - from the exit cube above a hole, say, so that the takeoff
+                // rocket leaves along a line that is actually clear. The checks below only see that from
+                // inside the hole none of its nodes are visible, and recompute it from our feet every tick
+                // (the wide search failing each time for the rock in its start node): twenty native searches
+                // a second for as long as we walk, and the takeoff then leaves along the path from the feet,
+                // straight back into the wall the exit was chosen to avoid. Resume once we are flying.
+                return;
+            }
+
+            if (process.inTakeoffGrace()) {
+                // The path we are flying was computed by the takeoff, from a cube chosen so the first boost
+                // leaves along something clear. The checks below recompute from the player's feet, and for
+                // the first tick or two after the elytra opens the feet are still in the hole - so the path
+                // is replaced by one aimed out of it, which is what the takeoff picked the cube to avoid.
+                // Measured: five takeoffs out of five had their path replaced on the first airborne tick.
+                return;
+            }
+
+            if (ctx.player().isInLava()) {
+                // Nothing here can be acted on while we are in a pool: solveAngles hands the whole tick to
+                // solveLavaEscape, which flies straight up and takes nothing from the path but a yaw. The
+                // checks below would still run, and from inside lava the view to every node is blocked by
+                // definition, so "no path points were visible" fires every tick and spends a full native
+                // search on a path that is not being followed - for as long as we are stuck, which is
+                // exactly when the game thread can least afford it. Resume when we are out.
                 return;
             }
 
@@ -1505,9 +1608,13 @@ public final class ElytraBehavior implements Helper {
         public FireworkBoost(final Integer fireworkTicksExisted, final int minimumBoostTicks) {
             this.fireworkTicksExisted = fireworkTicksExisted;
 
+            // A client holding the rocket alive past its lifetime keeps pushing for this much longer, and
+            // both ends of the window move with it: those extra ticks are as guaranteed as the rest, being
+            // held deliberately rather than rolled for.
+            final int extra = Math.max(0, Baritone.settings().elytraFireworkExtraBoostTicks.value);
             // this.lifetime = 10 * i + this.rand.nextInt(6) + this.rand.nextInt(7);
-            this.minimumBoostTicks = minimumBoostTicks;
-            this.maximumBoostTicks = minimumBoostTicks + 11;
+            this.minimumBoostTicks = minimumBoostTicks + extra;
+            this.maximumBoostTicks = this.minimumBoostTicks + 11;
         }
 
         public boolean isBoosted() {
@@ -1876,11 +1983,14 @@ public final class ElytraBehavior implements Helper {
             displacement.add(displacement.get(displacement.size() - 1).add(motion));
 
             if (i >= ticksBoostDelay && remainingTicksBoosted-- > 0) {
-                // See EntityFireworkRocket
+                // See EntityFireworkRocket. The 1.5 is vanilla's, and a client that boosts harder than that
+                // flies a faster trajectory than the one this loop raytraced, into blocks the raytrace never
+                // looked at - so it is a setting, to be told the truth by whatever changes it client side.
+                final double boostSpeed = Baritone.settings().elytraFireworkBoostMultiplier.value;
                 motion = motion.add(
-                        lookDirection.x * 0.1 + (lookDirection.x * 1.5 - motion.x) * 0.5,
-                        lookDirection.y * 0.1 + (lookDirection.y * 1.5 - motion.y) * 0.5,
-                        lookDirection.z * 0.1 + (lookDirection.z * 1.5 - motion.z) * 0.5
+                        lookDirection.x * 0.1 + (lookDirection.x * boostSpeed - motion.x) * 0.5,
+                        lookDirection.y * 0.1 + (lookDirection.y * boostSpeed - motion.y) * 0.5,
+                        lookDirection.z * 0.1 + (lookDirection.z * boostSpeed - motion.z) * 0.5
                 );
             }
         }
