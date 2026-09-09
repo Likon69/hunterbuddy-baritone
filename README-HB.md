@@ -5,7 +5,7 @@ HunterBuddy Meteor addon needs for long-distance elytra flight in the nether on 
 below is in the elytra code; nothing else in Baritone is touched.
 
 Built with `./gradlew :fabric:build -Pmod_version=1.3.0-hbN-1.21.11`, output in
-`dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb9**.
+`dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb12**.
 
 To see anything the elytra code logs, both of `#elytraChatSpam true` and `#chatDebug true` are
 needed - the verbose lines go through `logDebug`, which the second setting gates.
@@ -60,8 +60,10 @@ away read as walled in.
 
 Two more things about the moment of takeoff:
 
-- The look is held at the bearing to the destination, tilted up, for the whole jump. An elytra
-  keeps the direction it opened facing, so without this the glide started along whatever the last
+- The look is held at the bearing to the destination for the whole jump, tilted up by the same angle
+  as the runway that was measured clear - a fixed angle would be a different line from the one that
+  was checked, steep enough to hit the roof of a flat tunnel that had just passed. An elytra keeps
+  the direction it opened facing, so without any of this the glide started along whatever the last
   walking movement left the head pointing at.
 - The elytra path's start node has to be somewhere the player can actually get to. It is picked
   from the node cubes above the feet, preferring one grid cell towards the destination, but every
@@ -113,7 +115,27 @@ is the ground, so the solver saw a collision that was not on the flight path and
 solution". Now `expandTowards(motion)`, the vanilla swept volume, which grows only along the
 direction of travel.
 
-## 7. Path line colour
+## 7. Believe the client about how hard and how long it boosts
+
+The solver picks its pitch by simulating the boosted trajectory forward and raytracing it against the
+terrain. It took two things from vanilla, and a client that boosts differently makes both of them lies:
+
+- **Per-tick acceleration.** The simulation used a hardcoded `1.5`. A client with a firework speed
+  multiplier flies a faster, flatter trajectory than the one that was raytraced, into blocks the
+  raytrace never looked at - which is precisely what `hbonk` reports.
+- **How many boosted ticks remain.** `FireworkBoost` derives them from the rocket entity's age against
+  its lifetime. A client that cancels the rocket's removal keeps pushing after that runs out, and the
+  solver has by then taken the `guaranteed == 0` branch: four simulated ticks with a single boosted one,
+  and a flat pitch chosen for it, while the real flight is still accelerating.
+
+Both are now settings - `elytraFireworkBoostMultiplier` and `elytraFireworkExtraBoostTicks` - for the
+mod that changes them to set. At their defaults the arithmetic is byte for byte what it was.
+
+Neither is java-only, deliberately: when a flight goes into terrain for no visible reason, these are the
+first two things to read back with `#set`. The cost of that is that they persist, so a client killed
+mid-flight leaves a value behind; the mod that sets them is expected to clear them on join.
+
+## 8. Path line colour
 
 `elytraPathColor` (default red) instead of the hardcoded colour.
 
@@ -132,8 +154,21 @@ direction of travel.
 | `elytraPathColor` | red | Colour of the rendered flight path |
 | `elytraLandOnAnySolid` | `true` | Land on any solid top face, not just netherrack and gravel |
 | `elytraLandingBastionRadius` | `48` | Piglin brute radius that rejects a landing spot |
+| `elytraFireworkBoostMultiplier` | `1.5` | Firework acceleration the flight simulation assumes |
+| `elytraFireworkExtraBoostTicks` | `0` | Ticks a boost lasts beyond the rocket's own lifetime |
+
+Note that `elytraFireworkSpeed` is an older, unrelated setting: the minimum speed below which a firework
+is deployed, not an acceleration.
 
 ## Status
 
-None of this has been tested against a full nether crossing end to end. The takeoff ladder has been
-seen to dig its way out of a closed hole and carry on, which is what it was written for.
+None of this has been tested against a full nether crossing end to end. The takeoff ladder has been seen
+to dig its way out of a closed hole and carry on, which is what it was written for; on that same flight
+it then started the elytra path on the far side of a wall, which is what the line-of-sight test in
+section 2 was added for and has not been flown since.
+
+The takeoff ladder was reviewed twice after it was written, and what those reviews found has been fixed:
+the lift search skipping its own height near the world ceiling, the runway approved at one angle and
+launched at another, a spot-memory timer that could never elapse, a climb that cleared the one-climb
+rule, the ledge search skipped after a climb, both path callbacks able to write state into a behavior
+that had already been torn down, and the lift search re-walking a few thousand blocks every tick.
