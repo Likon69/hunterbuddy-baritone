@@ -68,6 +68,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static baritone.api.pathing.movement.ActionCosts.COST_INF;
 
@@ -334,6 +335,12 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      */
     private int serverCorrections;
     /**
+     * Wide paths that wandered enough for the search to try again with fine nodes, and how many of those the fine
+     * path then replaced. Counted on the pathfinder's own thread, hence atomic.
+     */
+    private final AtomicInteger detourRetries = new AtomicInteger();
+    private final AtomicInteger detourSwaps = new AtomicInteger();
+    /**
      * When the last flight ended, by the wall clock, so the next one can say how long the bot was on the ground
      * in between. The tick counter would be wrong across a reconnect, which starts it over.
      */
@@ -342,10 +349,13 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     /** The flight record's account of the flight in progress: where it started, what it spent and what it hit. */
     private Vec3 flightFrom;
     private Vec3 flightLastPos;
+    private BetterBlockPos flightDestination;
     private int flightLastTick;
     private boolean flightPinDecisionNoted;
     private int flightRocketsAtStart;
     private int flightCorrectionsAtStart;
+    private int flightDetourRetriesAtStart;
+    private int flightDetourSwapsAtStart;
     private double flightTravelled;
     private double flightTopSpeed;
     private int flightSlowTicks;
@@ -1265,10 +1275,13 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      */
     private void flightStarted() {
         this.flightFrom = ctx.player().position();
+        this.flightDestination = this.behavior.destination;
         this.flightLastPos = this.flightFrom;
         this.flightLastTick = ctx.player().tickCount;
         this.flightRocketsAtStart = this.rocketsLit;
         this.flightCorrectionsAtStart = this.serverCorrections;
+        this.flightDetourRetriesAtStart = this.detourRetries.get();
+        this.flightDetourSwapsAtStart = this.detourSwaps.get();
         this.flightWallHits = 0;
         this.flightCeilingHits = 0;
         this.flightFarthest = 0;
@@ -1297,6 +1310,14 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     /** Called by the behavior, on the game thread, for every position the server forces on us. */
     public void countSetback() {
         this.serverCorrections++;
+    }
+
+    /**
+     * Called by the behavior, from the pathfinder's thread, for every wide path it searched again with fine nodes
+     * because it wandered, {@code swapped} when the fine path was the one kept.
+     */
+    public void countDetourRetry(boolean swapped) {
+        (swapped ? this.detourSwaps : this.detourRetries).incrementAndGet();
     }
 
     /** Keeps the account of the flight in progress. */
@@ -1342,14 +1363,27 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 : ctx.player().isInLava() ? "in lava"
                 : ctx.player().onGround() ? "on the ground" : "in the air with the elytra shut";
         final int noPitch = this.behavior.takeNoPitchTicks();
+        // The heading the flight held, as a Minecraft yaw (the one F3 shows), against the yaw of the destination
+        // from where the flight started: how closely the path kept to the heading. Left out of a flight too short
+        // to have one.
+        final double courseX = pos.x - this.flightFrom.x;
+        final double courseZ = pos.z - this.flightFrom.z;
+        final int leg = Baritone.settings().elytraPathLegLength.value;
+        final String course = courseX * courseX + courseZ * courseZ < 100 * 100 ? ""
+                : String.format(Locale.ROOT, ", course yaw %.1f with the destination at yaw %.1f (%s)",
+                Math.toDegrees(Math.atan2(-courseX, courseZ)),
+                Math.toDegrees(Math.atan2(-(this.flightDestination.x + 0.5 - this.flightFrom.x),
+                        this.flightDestination.z + 0.5 - this.flightFrom.z)),
+                leg > 0 ? "legs of " + leg + " blocks" : "aimed at the destination");
         FlightLog.log(String.format(Locale.ROOT,
-                "flight: ended after %d ticks %s at %.1f %.1f %.1f, %.0f blocks from where it started (%.0f at the farthest)%s, %.0f blocks travelled at %.2f b/t on average (%.1f blocks/s, top %.2f b/t, %d ticks under %.1f b/t), rockets %d, server corrections %d, solver boost x%.2f +%d ticks, relight under %.2f b/t, wall hits %d, ceiling or floor hits %d%s%s, state %s",
+                "flight: ended after %d ticks %s at %.1f %.1f %.1f, %.0f blocks from where it started (%.0f at the farthest)%s, %.0f blocks travelled at %.2f b/t on average (%.1f blocks/s, top %.2f b/t, %d ticks under %.1f b/t)%s, rockets %d, server corrections %d, solver boost x%.2f +%d ticks, relight under %.2f b/t, wall hits %d, ceiling or floor hits %d, detour retries %d (fine path kept %d)%s%s, state %s",
                 this.flyingTicks, where, pos.x, pos.y, pos.z, pos.distanceTo(this.flightFrom), this.flightFarthest,
                 this.takeoffSpot == null ? ""
                         : String.format(Locale.ROOT, ", %.0f horizontally from the takeoff spot, which stays remembered",
                         Math.sqrt(horizontalDistSq(this.takeoffSpot, new BetterBlockPos(pos.x, pos.y, pos.z)))),
                 this.flightTravelled, this.flightTravelled / this.flyingTicks, 20 * this.flightTravelled / this.flyingTicks,
                 this.flightTopSpeed, this.flightSlowTicks, SLOW_FLIGHT_SPEED,
+                course,
                 Math.max(0, this.rocketsLit - this.flightRocketsAtStart),
                 Math.max(0, this.serverCorrections - this.flightCorrectionsAtStart),
                 // the boost model the solver planned with, which a boost module may or may not have set: the
@@ -1358,6 +1392,8 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 Baritone.settings().elytraFireworkExtraBoostTicks.value,
                 Baritone.settings().elytraFireworkSpeed.value,
                 this.flightWallHits, this.flightCeilingHits,
+                Math.max(0, this.detourRetries.get() - this.flightDetourRetriesAtStart),
+                Math.max(0, this.detourSwaps.get() - this.flightDetourSwapsAtStart),
                 this.pinnedTicks > TAKEOFF_PINNED_TICKS ? ", pinned at the end" : "",
                 noPitch > 0 ? ", the last " + noPitch + " ticks without a pitch solution" : "",
                 this.state));

@@ -239,7 +239,7 @@ public final class ElytraBehavior implements Helper {
 
         public CompletableFuture<Void> pathToDestination(final BlockPos from) {
             final long start = System.nanoTime();
-            return this.path0(from, ElytraBehavior.this.destination, UnaryOperator.identity())
+            return this.pathOnwards(from, UnaryOperator.identity())
                     .thenRun(() -> {
                         final double distance = this.path.get(0).distanceTo(this.path.get(this.path.size() - 1));
                         if (this.completePath) {
@@ -274,18 +274,21 @@ public final class ElytraBehavior implements Helper {
             final boolean complete = this.completePath;
             final BetterBlockPos from = ctx.playerFeet();
 
-            return this.path0(from, upToIncl.isPresent() ? this.path.get(upToIncl.getAsInt()) : ElytraBehavior.this.destination, segment -> {
-                        if (!upToIncl.isPresent() || !segment.isFinished()) {
-                            // Either this went all the way to the destination and speaks for itself, or the
-                            // search ran out of time short of the rejoin node. Tacking the old tail onto a
-                            // segment that never reached it would leave a blind jump in the path, straight
-                            // through whatever lies between, that no obstacle check can ever fix: every
-                            // recomputation ends the same way, and the solver just circles the last node it
-                            // can reach. Leave the path unfinished instead and continue from where it got to.
-                            return segment;
-                        }
-                        return segment.append(after.stream(), complete);
-                    })
+            final UnaryOperator<UnpackedSegment> rejoin = segment -> {
+                if (!upToIncl.isPresent() || !segment.isFinished()) {
+                    // Either this was aimed onwards, at the destination or the end of a leg, and speaks for itself,
+                    // or the search ran out of time short of the rejoin node. Tacking the old tail onto a
+                    // segment that never reached it would leave a blind jump in the path, straight
+                    // through whatever lies between, that no obstacle check can ever fix: every
+                    // recomputation ends the same way, and the solver just circles the last node it
+                    // can reach. Leave the path unfinished instead and continue from where it got to.
+                    return segment;
+                }
+                return segment.append(after.stream(), complete);
+            };
+            return (upToIncl.isPresent()
+                    ? this.path0(from, this.path.get(upToIncl.getAsInt()), rejoin)
+                    : this.pathOnwards(from, rejoin))
                     .whenComplete((result, ex) -> {
                         this.recalculating = false;
                         if (ex != null) {
@@ -312,7 +315,7 @@ public final class ElytraBehavior implements Helper {
             final long start = System.nanoTime();
             final BetterBlockPos pathStart = this.path.get(afterIncl);
 
-            this.path0(pathStart, ElytraBehavior.this.destination, segment -> segment.prepend(before.stream()))
+            this.pathOnwards(pathStart, segment -> segment.prepend(before.stream()))
                     .thenRun(() -> {
                         final int recompute = this.path.size() - before.size() - 1;
                         final double distance = this.path.get(0).distanceTo(this.path.get(recompute));
@@ -472,6 +475,72 @@ public final class ElytraBehavior implements Helper {
         }
 
         /**
+         * {@link #path0} aimed onwards: at the destination, or at the end of the next leg of the way when the
+         * destination is farther off than a leg (see {@link #legTarget}). Reaching the end of a leg does not
+         * finish the path, so that segment is handed on unfinished, and the next segment carries on from its end
+         * the way it already does from a search that ran out before the destination.
+         */
+        private CompletableFuture<Void> pathOnwards(BlockPos src, UnaryOperator<UnpackedSegment> operator) {
+            final BetterBlockPos leg = this.legTarget(src);
+            if (leg == null) {
+                return this.path0(src, ElytraBehavior.this.destination, operator);
+            }
+            return this.path0(src, leg, segment -> operator.apply(segment.unfinished()));
+        }
+
+        /**
+         * The end of the leg a search from {@code from} aims at: a point on the straight line to the destination, at
+         * least {@link Settings#elytraPathLegLength} blocks along it, the height following the same line. {@code null}
+         * when the search should aim at the destination itself: it is no more than a leg away, legs are off, or
+         * this path goes to a landing spot or follows a corridor, where there is no heading to hold.
+         * <p>
+         * The native search only steps along the six axes, and its goal draws it by straight-line distance, so
+         * aimed at a destination far away it runs along whichever axis is nearer the heading and only turns once
+         * the destination lies at 45 degrees. Aimed a leg ahead it does the same within the leg, straying at most
+         * about a fifth of the leg off the line, and the next leg starts over from where this one ended.
+         * <p>
+         * The point is pushed out along the line past the chunks the client has loaded, and a chunk further, so that
+         * the air nearest to it is out there too. The native search moves a goal it has no room at to the nearest
+         * air, which inside loaded terrain is as likely as not the near face of the rock the line runs into: the leg
+         * would end against it, and the next one would start by backing out of it. From out there, the search goes
+         * through all of the loaded terrain on its way, round whatever is in it, the way it went towards the far
+         * destination; and the leg ends in chunks nobody flies through before they load, which is also when the
+         * next segment is asked for, as it always was.
+         */
+        private BetterBlockPos legTarget(final BlockPos from) {
+            final int leg = Baritone.settings().elytraPathLegLength.value;
+            final boolean corridor = ElytraBehavior.this.corridorContext != null && process.hasCorridor()
+                    && Baritone.settings().elytraCorridor.value;
+            if (leg <= 0 || ElytraBehavior.this.appendDestination || corridor) {
+                return null;
+            }
+            final BetterBlockPos dest = ElytraBehavior.this.destination;
+            final double dx = dest.x - from.getX();
+            final double dz = dest.z - from.getZ();
+            final double distance = Math.sqrt(dx * dx + dz * dz);
+            // in chunk-sized steps, out to well past the farthest a client loads; all of that loaded, and it is as if
+            // the destination were no further
+            for (double along = leg; along + 16 < distance && along <= leg + 1024; along += 16) {
+                // both the sample and the point handed back out of the loaded chunks: the loaded area is made of
+                // whole chunks and fills in unevenly at its edge, so one sample out of it does not put the next out
+                final BetterBlockPos end = pointAlong(from, dest, (along + 16) / distance);
+                if (!ctx.world().isLoaded(pointAlong(from, dest, along / distance)) && !ctx.world().isLoaded(end)) {
+                    return end;
+                }
+            }
+            return null;
+        }
+
+        /** The point {@code fraction} of the way from {@code from} to {@code dest}, at a height the native search accepts. */
+        private static BetterBlockPos pointAlong(final BlockPos from, final BetterBlockPos dest, final double fraction) {
+            return new BetterBlockPos(
+                    from.getX() + (int) Math.round((dest.x - from.getX()) * fraction),
+                    Mth.clamp(from.getY() + (int) Math.round((dest.y - from.getY()) * fraction), 0, 127),
+                    from.getZ() + (int) Math.round((dest.z - from.getZ()) * fraction)
+            );
+        }
+
+        /**
          * The search behind every path computation: inside the corridor first when one is set, on the full map
          * otherwise or when the corridor has no way through. Called on the game thread (every caller is a tick or
          * a takeoff state), which {@link #corridorAdmit} relies on; the continuations run on the native contexts'
@@ -541,6 +610,7 @@ public final class ElytraBehavior implements Helper {
                             final double wide = detourRatio(src, segment);
                             if (wide > Baritone.settings().elytraPathDetourRatio.value) {
                                 logVerbose(String.format("path: %s x4 wanders (%.2fx the straight line), trying x2", label, wide));
+                                process.countDetourRetry(false);
                                 return fineSearch(where, label, src, dst).thenApply(fine -> {
                                     // Only take the fine path if it really is the straighter one. The wide
                                     // search is the fast one and flies better, so it keeps the segment unless
@@ -560,6 +630,7 @@ public final class ElytraBehavior implements Helper {
                                             && (fine.finished || lastNodeDistSq(fine, dst) <= lastNodeDistSq(segment, dst));
                                     if (comparable && narrow < wide) {
                                         logVerbose(String.format("path: %s x2 is straighter (%.2fx), taking it", label, narrow));
+                                        process.countDetourRetry(true);
                                         return fine;
                                     }
                                     return segment;

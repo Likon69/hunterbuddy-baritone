@@ -1595,6 +1595,23 @@ public final class Settings {
     public final Setting<Double> elytraPathDetourRatio = new Setting<>(1.6D);
 
     /**
+     * How far ahead each elytra path search aims, at the least, in blocks, while the destination is farther away
+     * than that: at a point on the straight line to the destination instead of at the destination itself. The
+     * point is this many blocks along, or further out when that is still in the chunks the client has loaded, so
+     * that the search goes through all of the loaded terrain, as it did towards the destination. {@code 0} aims
+     * every search at the destination.
+     * <p>
+     * The nether pathfinder only steps along the six axes, and its goal draws it by straight-line distance. Aimed
+     * at a destination far away, it runs along whichever axis is nearer the heading and only turns once the
+     * destination lies at 45 degrees, however far away that is: at 21 degrees off an axis, the bot flies along
+     * the axis and makes up the heading at the very end. Aimed a leg ahead, the path still starts along the axis
+     * and ends on the diagonal, but only within that leg. It strays at most about a fifth of the leg off the
+     * line, and the next leg starts over from where this one ended. Shorter legs hold the heading more closely,
+     * at the price of one more search per leg.
+     */
+    public final Setting<Integer> elytraPathLegLength = new Setting<>(128);
+
+    /**
      * Write a line per tick for the first moments of every takeoff: what the launch spot measured, where the
      * flight path was asked to start, and then, tick by tick, where the path's first node actually is.
      * <p>

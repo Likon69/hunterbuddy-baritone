@@ -49,6 +49,14 @@ public final class UnpackedSegment {
         return new UnpackedSegment(Stream.concat(other, this.path), this.finished);
     }
 
+    /**
+     * The same segment, not finished: for a search that was aimed at only part of the way, whose reaching its
+     * goal does not complete the path.
+     */
+    public UnpackedSegment unfinished() {
+        return new UnpackedSegment(this.path, false);
+    }
+
     public List<BetterBlockPos> collect() {
         final List<BetterBlockPos> path = this.path.collect(Collectors.toList());
 
