@@ -22,6 +22,7 @@ import baritone.api.Settings;
 import baritone.api.behavior.look.IAimProcessor;
 import baritone.api.behavior.look.ITickableAimProcessor;
 import baritone.api.event.events.*;
+import baritone.api.event.events.type.EventState;
 import baritone.api.pathing.goals.GoalBlock;
 import baritone.api.utils.*;
 import baritone.api.utils.input.Input;
@@ -113,6 +114,18 @@ public final class ElytraBehavior implements Helper {
 
     private static final int FIREWORK_COOLDOWN_TICKS = 10;
     /**
+     * How far from where it was asked to start a path may begin before {@link PathManager#noteStart} writes it
+     * down: past one neighbouring 4-block node, which is as far as an ordinary search ever moves a start.
+     */
+    private static final int START_MOVED_NOTE_BLOCKS = 6;
+    /**
+     * How long a stretch without a pitch solution has to last before the flight record mentions it. Shorter ones
+     * come and go every few ticks in a tight passage and say nothing.
+     */
+    private static final int NO_PITCH_NOTE_TICKS = 5;
+    /** How often, at most, the flight record notes a recalculation from our own feet that started elsewhere. */
+    private static final int RECALC_NOTE_INTERVAL_TICKS = 40;
+    /**
      * Remaining cool-down ticks between firework usage
      */
     private int remainingFireworkTicks;
@@ -135,6 +148,10 @@ public final class ElytraBehavior implements Helper {
      * a rocket that never shows up is one the server ignored.
      */
     private boolean fireworkSeenSinceLit = true;
+    /** Consecutive flight ticks the solver has had no pitch solution for; see {@link #tick()}. */
+    private int noPitchTicks;
+    /** Whether the flight record already says the hotbar is out of rockets; cleared by the next one lit. */
+    private boolean noFireworksNoted;
 
     private BlockStateInterface bsi;
     private final BlockStateOctreeInterface boi;
@@ -237,9 +254,12 @@ public final class ElytraBehavior implements Helper {
                             final Throwable cause = ex.getCause();
                             if (cause instanceof PathCalculationException) {
                                 logDirect("Failed to compute path to destination");
+                                FlightLog.log("path: no path to the destination from " + from);
                             } else {
                                 logUnhandledException(cause);
                             }
+                        } else {
+                            this.noteStart("path", new BetterBlockPos(from));
                         }
                     });
         }
@@ -252,8 +272,9 @@ public final class ElytraBehavior implements Helper {
             this.recalculating = true;
             final List<BetterBlockPos> after = upToIncl.isPresent() ? this.path.subList(upToIncl.getAsInt() + 1, this.path.size()) : Collections.emptyList();
             final boolean complete = this.completePath;
+            final BetterBlockPos from = ctx.playerFeet();
 
-            return this.path0(ctx.playerFeet(), upToIncl.isPresent() ? this.path.get(upToIncl.getAsInt()) : ElytraBehavior.this.destination, segment -> {
+            return this.path0(from, upToIncl.isPresent() ? this.path.get(upToIncl.getAsInt()) : ElytraBehavior.this.destination, segment -> {
                         if (!upToIncl.isPresent() || !segment.isFinished()) {
                             // Either this went all the way to the destination and speaks for itself, or the
                             // search ran out of time short of the rejoin node. Tacking the old tail onto a
@@ -275,6 +296,8 @@ public final class ElytraBehavior implements Helper {
                             } else {
                                 logUnhandledException(cause);
                             }
+                        } else {
+                            this.noteStart("recalc", from);
                         }
                     });
         }
@@ -394,6 +417,50 @@ public final class ElytraBehavior implements Helper {
 
         public int getNear() {
             return this.playerNear;
+        }
+
+        /** The last start {@link #noteStart} wrote down, so a search repeated every tick is written once. */
+        private String lastStartNote = "";
+        private int lastRecalcNoteTick = -RECALC_NOTE_INTERVAL_TICKS;
+
+        /**
+         * Writes down a search whose path came back starting somewhere other than where it was asked to start.
+         * The native search moves a start it has no room for to the nearest air it knows of, so this is the line
+         * that says the pathfinder's picture of the terrain and the client's disagree here - with what the client
+         * has in the block the search was asked to start from.
+         * <p>
+         * It reads the client world only, on purpose: it runs in a task on the game thread that can overlap the
+         * solver's own thread, and the pathfinder's cache reader is not safe to share. And it must never throw: it
+         * sits inside the future a takeoff waits on, where an exception would throw a good path away.
+         */
+        private void noteStart(final String why, final BetterBlockPos from) {
+            if (!FlightLog.enabled() || this.path.isEmpty()) {
+                return;
+            }
+            try {
+                final BetterBlockPos first = this.path.get(0);
+                final double off = Math.sqrt(first.distanceSq(from));
+                if (off <= START_MOVED_NOTE_BLOCKS) {
+                    return;
+                }
+                final String key = why + from + first;
+                final boolean recalc = "recalc".equals(why);
+                final int now = ctx.player().tickCount;
+                if (key.equals(this.lastStartNote) || recalc && now >= this.lastRecalcNoteTick
+                        && now - this.lastRecalcNoteTick < RECALC_NOTE_INTERVAL_TICKS) {
+                    return;
+                }
+                this.lastStartNote = key;
+                if (recalc) {
+                    this.lastRecalcNoteTick = now;
+                }
+                FlightLog.log(String.format(Locale.ROOT,
+                        "%s: asked to start at %d %d %d (%s there), the path starts at %d %d %d, %.1f blocks away",
+                        why, from.x, from.y, from.z, ctx.world().getBlockState(from).getBlock(),
+                        first.x, first.y, first.z, off));
+            } catch (RuntimeException ignored) {
+                // a line of log is not worth a path
+            }
         }
 
         // mickey resigned
@@ -995,8 +1062,14 @@ public final class ElytraBehavior implements Helper {
 
     public void onReceivePacket(PacketEvent event) {
         if (event.getPacket() instanceof ClientboundPlayerPositionPacket) {
+            // the event fires twice for every packet, before it is handled and after: count it once
+            final boolean count = event.getState() == EventState.PRE;
             ctx.minecraft().execute(() -> {
                 this.remainingSetBackTicks = Baritone.settings().elytraFireworkSetbackUseDelay.value;
+                // counted here, on the game thread, with everything else the flight record keeps
+                if (count) {
+                    this.process.countSetback();
+                }
             });
         }
     }
@@ -1116,6 +1189,7 @@ public final class ElytraBehavior implements Helper {
             this.remainingFireworkTicks--;
             if (this.remainingFireworkTicks == 0 && !this.fireworkSeenSinceLit) {
                 logVerbose("the rocket lit " + FIREWORK_COOLDOWN_TICKS + " ticks ago never showed up, the server ignored it");
+                FlightLog.log("rocket: the one lit " + FIREWORK_COOLDOWN_TICKS + " ticks ago never showed up, the server ignored it");
             }
         }
         if (this.remainingSetBackTicks > 0) {
@@ -1205,8 +1279,25 @@ public final class ElytraBehavior implements Helper {
 
         if (!solution.solvedPitch) {
             logVerbose("no pitch solution, probably gonna crash in a few ticks LOL!!!");
+            if (++this.noPitchTicks == NO_PITCH_NOTE_TICKS) {
+                // Once per stretch, not per tick: a pinned glide sits in here for seconds. Nothing below this
+                // runs while it does, the solver's rockets included, which is the part worth knowing when
+                // reading back a flight that lost all its speed against a wall.
+                final Vec3 pos = ctx.player().position();
+                final NetherPath path = this.pathManager.getPath();
+                final int near = Math.min(this.pathManager.getNear(), Math.max(0, path.size() - 1));
+                FlightLog.log(String.format(Locale.ROOT,
+                        "solver: for %d ticks no pitch has reached the path, now at %.1f %.1f %.1f (speed %.2f, nearest node %d of %d%s), flying yaw %.0f pitch %.0f to stay clear, and the solver lights no rocket until a pitch is found",
+                        NO_PITCH_NOTE_TICKS, pos.x, pos.y, pos.z, ctx.player().getDeltaMovement().length(), near, path.size(),
+                        path.isEmpty() ? "" : String.format(Locale.ROOT, ", %.1f blocks away", Math.sqrt(ctx.player().distanceToSqr(path.getVec(near)))),
+                        solution.rotation.getYaw(), solution.rotation.getPitch()));
+            }
             return;
         } else {
+            if (this.noPitchTicks >= NO_PITCH_NOTE_TICKS) {
+                FlightLog.log("solver: a pitch reaches the path again, after " + this.noPitchTicks + " ticks without one");
+            }
+            this.noPitchTicks = 0;
             this.aimPos = new BetterBlockPos(solution.goingTo.x, solution.goingTo.y, solution.goingTo.z);
         }
 
@@ -1448,7 +1539,7 @@ public final class ElytraBehavior implements Helper {
                 && currentSpeed < elytraFireworkSpeed * elytraFireworkSpeed))
         ) {
             logVerbose("attempting to use firework" + (forceUseFirework ? " (forced)" : ""));
-            this.useFirework();
+            this.useFirework(inLava ? "lava" : forceUseFirework ? "solver, forced" : "solver");
         }
     }
 
@@ -1461,19 +1552,47 @@ public final class ElytraBehavior implements Helper {
      */
     public boolean useFireworkForTakeoff() {
         if (this.remainingFireworkTicks > 0 || this.getAttachedFirework().isPresent()) {
+            FlightLog.log("rocket: no takeoff rocket needed, one is already burning");
             return true;
         }
-        return this.useFirework();
+        return this.useFirework("takeoff");
+    }
+
+    /**
+     * The stretch of flight ticks without a pitch solution that is still open, for the flight record to close
+     * when the flight ends in the middle of one. Resets it.
+     */
+    public int takeNoPitchTicks() {
+        final int ticks = this.noPitchTicks;
+        this.noPitchTicks = 0;
+        return ticks;
+    }
+
+    /**
+     * Whether the pathfinder's cache holds this block as solid: the picture the flight path and the solver work
+     * from, which is not always the client's. Game thread only, and only while the solver is not running - on
+     * the ground, say: the cache reader is shared with the solver and is not thread-safe.
+     */
+    public boolean nativeSolid(int x, int y, int z) {
+        // the cache cull frees chunks under this lock, and the reader caches a pointer to the last one it read
+        synchronized (this.context.cullingLock) {
+            return !this.passable(x, y, z, false);
+        }
     }
 
     /**
      * @return {@code true} if a firework was used
      */
-    private boolean useFirework() {
+    private boolean useFirework(final String why) {
         // the main hand is what processRightClick uses, and selectFirework settles for putting something harmless
         // there when the only firework we have is in the off hand, which would right click nothing at all
         if (!this.selectFirework() || !isFireworks(ctx.player().getItemInHand(InteractionHand.MAIN_HAND))) {
             logDirect("no fireworks");
+            if (!this.noFireworksNoted) {
+                // once until a rocket is lit again: the solver asks for one every tick while it is slow
+                this.noFireworksNoted = true;
+                FlightLog.log("rocket: wanted one (" + why + ") and there is none in the hotbar");
+            }
             return false;
         }
         // The use packet carries a look of its own, read off the player as it is built, and the server-side
@@ -1495,6 +1614,11 @@ public final class ElytraBehavior implements Helper {
         this.minimumBoostTicks = 10 * (1 + getFireworkBoost(ctx.player().getItemInHand(InteractionHand.MAIN_HAND)).orElse(0));
         this.remainingFireworkTicks = FIREWORK_COOLDOWN_TICKS;
         this.fireworkSeenSinceLit = false;
+        this.noFireworksNoted = false;
+        this.process.countRocket();
+        final Vec3 pos = ctx.player().position();
+        FlightLog.log(String.format(Locale.ROOT, "rocket: %s, at %.1f %.1f %.1f, speed %.2f, facing yaw %.0f pitch %.0f",
+                why, pos.x, pos.y, pos.z, ctx.player().getDeltaMovement().length(), wire.getYaw(), wire.getPitch()));
         return true;
     }
 

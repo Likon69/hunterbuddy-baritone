@@ -1610,6 +1610,15 @@ public final class Settings {
     public final Setting<Integer> elytraTakeoffJournalTicks = new Setting<>(40);
 
     /**
+     * Keep a record of every elytra flight in the game log (latest.log, never the chat), each line starting with
+     * {@code [flight]}: why each rung of the takeoff ladder was chosen and on what numbers, where each flight path
+     * was asked to start and where it actually starts, every rocket, every stretch the solver had no pitch for,
+     * every fall, and how every flight ended. On by default: it is a few lines a minute in ordinary flight, and
+     * the failures it is there for are the ones nobody can reproduce on demand.
+     */
+    public final Setting<Boolean> elytraFlightLog = new Setting<>(true);
+
+    /**
      * Honour a path corridor pushed by another mod (a set of chunks the path is allowed to use, for instance a
      * trail being followed). The path is searched inside the corridor first, with everything outside it treated
      * as solid, and the full map is only consulted when the corridor has no way through. No effect while no
