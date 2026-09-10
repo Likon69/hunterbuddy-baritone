@@ -47,6 +47,20 @@ public final class NetherPathfinderContext {
 
     private static final BlockState AIR_BLOCK_STATE = Blocks.AIR.defaultBlockState();
     /**
+     * The other two kinds of air. This packer was written when there was only one, and kept testing for that one
+     * alone: every other block went into the cache as solid. Since 1.13 the nether carver fills what it carves
+     * with cave air above the lava level ({@code NetherWorldCarver#carveBlock}), so in terrain generated since
+     * then every carved tunnel and pocket was rock to the pathfinder - and to the solver, which reads the same
+     * cache - while the takeoff, which reads the client world, saw open air there and launched from it.
+     * <p>
+     * Measured on a flight: nine launches in a row from one pocket, each asking for a path from a 4x4x4 cube the
+     * takeoff had checked was air, each getting one whose first node sat in the same column nine blocks further
+     * down. The same thing happened to searches started from the player's own position while it was scraping
+     * along the pocket's ceiling - in open air, and after its chunks had been packed again.
+     */
+    private static final BlockState CAVE_AIR_BLOCK_STATE = Blocks.CAVE_AIR.defaultBlockState();
+    private static final BlockState VOID_AIR_BLOCK_STATE = Blocks.VOID_AIR.defaultBlockState();
+    /**
      * A whole chunk of solid, in the layout {@code NetherPathfinder.insertChunkData} expects (index
      * {@code y << 8 | z << 4 | x}, 16x128x16). Inserted for every chunk a corridor search must not enter. The
      * native side copies the array and never writes back, so one shared instance is safe.
@@ -172,7 +186,8 @@ public final class NetherPathfinderContext {
             event.getBlocks().forEach(pair -> {
                 BlockPos pos = pair.first();
                 if (pos.getY() >= 128) return;
-                boolean isSolid = pair.second() != AIR_BLOCK_STATE;
+                // any of the three airs, the same test writeChunkData makes
+                boolean isSolid = !pair.second().isAir();
                 Octree.setBlock(ptr, pos.getX() & 15, pos.getY(), pos.getZ() & 15, isSolid);
             });
         });
@@ -332,10 +347,10 @@ public final class NetherPathfinderContext {
                 }
                 final PalettedContainer<BlockState> bsc = extendedblockstorage.getStates();
                 IPalettedContainer<BlockState> iPalettedContainer = (IPalettedContainer<BlockState>) bsc;
-                int airId = -1;
-                if (iPalettedContainer.getPalette().maybeHas(state -> state.equals(AIR_BLOCK_STATE))) {
-                    airId = iPalettedContainer.getPalette().idFor(AIR_BLOCK_STATE, PaletteResize.noResizeExpected());
-                }
+                // all three airs, not only the plain one: see CAVE_AIR_BLOCK_STATE
+                final int airId = paletteId(iPalettedContainer, AIR_BLOCK_STATE);
+                final int caveAirId = paletteId(iPalettedContainer, CAVE_AIR_BLOCK_STATE);
+                final int voidAirId = paletteId(iPalettedContainer, VOID_AIR_BLOCK_STATE);
                 // pasted from FasterWorldScanner
                 final BitStorage array = iPalettedContainer.getStorage();
                 if (array == null) continue;
@@ -345,6 +360,24 @@ public final class NetherPathfinderContext {
                 long maxEntryValue = (1L << bitsPerEntry) - 1L;
 
                 final int yReal = y0 << 4;
+                if (bitsPerEntry == 0) {
+                    // A section that is one state throughout arrives with no data at all: a zero-bit storage whose
+                    // raw array is empty, so the loop below writes nothing, and the section kept whatever the
+                    // native chunk already held - all air for a chunk it had just created, or the terrain that
+                    // elytraPredictTerrain or findAir generated for it. A section of pure netherrack was open air
+                    // to the pathfinder and the solver, and so was one of pure lava in the middle of the lava sea.
+                    // FasterWorldScanner.visitSection has always handled this case; this copy of its loop never
+                    // did. Air is written as well as solid, so the result does not depend on what was there before.
+                    final boolean solid = !iPalettedContainer.getPalette().valueFor(0).isAir();
+                    for (int y = yReal; y < yReal + 16; y++) {
+                        for (int z = 0; z < 16; z++) {
+                            for (int x = 0; x < 16; x++) {
+                                Octree.setBlock(ptr, x, y, z, solid);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 for (int i = 0, idx = 0; i < longArray.length && idx < arraySize; ++i) {
                     long l = longArray[i];
                     for (int offset = 0; offset <= (64 - bitsPerEntry) && idx < arraySize; offset += bitsPerEntry, ++idx) {
@@ -352,7 +385,7 @@ public final class NetherPathfinderContext {
                         int x = (idx & 15);
                         int y = yReal + (idx >> 8);
                         int z = ((idx >> 4) & 15);
-                        Octree.setBlock(ptr, x, y, z, value != airId);
+                        Octree.setBlock(ptr, x, y, z, value != airId && value != caveAirId && value != voidAirId);
                     }
                 }
             }
@@ -361,6 +394,14 @@ public final class NetherPathfinderContext {
             e.printStackTrace();
             throw new RuntimeException(e);
         }
+    }
+
+    /** The id {@code state} has in this section's palette, or {@code -1} if the section holds none of it. */
+    private static int paletteId(IPalettedContainer<BlockState> container, BlockState state) {
+        if (!container.getPalette().maybeHas(candidate -> candidate.equals(state))) {
+            return -1;
+        }
+        return container.getPalette().idFor(state, PaletteResize.noResizeExpected());
     }
 
     public static final class Visibility {

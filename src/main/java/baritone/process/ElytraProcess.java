@@ -1949,7 +1949,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                     return new BetterBlockPos(mut);
                 }
                 return null;
-            } else if (block != Blocks.AIR) {
+            } else if (!(block instanceof AirBlock)) {
                 return null;
             }
             mut.set(mut.getX(), mut.getY() - 1, mut.getZ());
@@ -1973,7 +1973,10 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
         while (!queue.isEmpty()) {
             BetterBlockPos pos = queue.poll();
-            if (ctx.world().isLoaded(pos) && isInBounds(pos) && ctx.world().getBlockState(pos).getBlock() == Blocks.AIR) {
+            // Any of the three airs, like the column and bubble checks below. Now that the pathfinder counts cave
+            // air as air a path can end in a carved cave, and a search that only spread through plain air would
+            // stop at its very first block there and leave us circling until the rockets ran out.
+            if (ctx.world().isLoaded(pos) && isInBounds(pos) && ctx.world().getBlockState(pos).getBlock() instanceof AirBlock) {
                 BetterBlockPos actualLandingSpot = checkLandingSpot(pos, checkedPositions);
                 if (actualLandingSpot != null && isColumnAir(actualLandingSpot, LANDING_COLUMN_HEIGHT) && hasAirBubble(actualLandingSpot.above(LANDING_COLUMN_HEIGHT)) && !badLandingSpots.contains(actualLandingSpot.above(LANDING_COLUMN_HEIGHT))) {
                     String rejection = bastionRejectionReason(actualLandingSpot);
