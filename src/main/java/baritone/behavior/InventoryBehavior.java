@@ -31,6 +31,7 @@ import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.item.context.UseOnContext;
 import net.minecraft.world.level.block.Block;
@@ -40,6 +41,7 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
+import java.util.List;
 import java.util.OptionalInt;
 import java.util.Random;
 import java.util.function.Predicate;
@@ -168,6 +170,47 @@ public final class InventoryBehavior extends Behavior implements Helper {
         return false;
     }
 
+    /** How much obsidian the inventory holds, offhand included. */
+    public int obsidianCount() {
+        int count = 0;
+        for (ItemStack stack : ctx.player().getInventory().getNonEquipmentItems()) {
+            if (stack.getItem() == Items.OBSIDIAN) {
+                count += stack.getCount();
+            }
+        }
+        final ItemStack offhand = ctx.player().getOffhandItem();
+        if (offhand.getItem() == Items.OBSIDIAN) {
+            count += offhand.getCount();
+        }
+        return count;
+    }
+
+    /**
+     * How many blocks Baritone may place without going into {@link baritone.api.Settings#obsidianReserve}: the
+     * other {@link baritone.api.Settings#acceptableThrowawayItems} it can reach (the hotbar and the offhand, the whole
+     * inventory with allowInventory), and the obsidian over the reserve.
+     */
+    public int spendableThrowawayCount() {
+        final List<Item> acceptable = Baritone.settings().acceptableThrowawayItems.value;
+        final NonNullList<ItemStack> inv = ctx.player().getInventory().getNonEquipmentItems();
+        final int reach = Baritone.settings().allowInventory.value ? inv.size() : 9;
+        int other = 0;
+        for (int i = 0; i < reach; i++) {
+            final ItemStack stack = inv.get(i);
+            if (stack.getItem() != Items.OBSIDIAN && acceptable.contains(stack.getItem())) {
+                other += stack.getCount();
+            }
+        }
+        final ItemStack offhand = ctx.player().getOffhandItem();
+        if (offhand.getItem() != Items.OBSIDIAN && acceptable.contains(offhand.getItem()) && this.offhandPlaceable(inv)) {
+            other += offhand.getCount();
+        }
+        final int obsidian = acceptable.contains(Items.OBSIDIAN)
+                ? Math.max(0, this.obsidianCount() - Baritone.settings().obsidianReserve.value)
+                : 0;
+        return other + obsidian;
+    }
+
     public boolean selectThrowawayForLocation(boolean select, int x, int y, int z) {
         BlockState maybe = baritone.getBuilderProcess().placeAt(x, y, z, baritone.bsi.get0(x, y, z));
         if (maybe != null && throwaway(select, stack -> stack.getItem() instanceof BlockItem && maybe.equals(((BlockItem) stack.getItem()).getBlock().getStateForPlacement(new BlockPlaceContext(new UseOnContext(ctx.world(), ctx.player(), InteractionHand.MAIN_HAND, stack, new BlockHitResult(new Vec3(ctx.player().position().x, ctx.player().position().y, ctx.player().position().z), Direction.UP, ctx.playerFeet(), false)) {}))))) {
@@ -188,9 +231,24 @@ public final class InventoryBehavior extends Behavior implements Helper {
         return throwaway(select, desired, Baritone.settings().allowInventory.value);
     }
 
-    public boolean throwaway(boolean select, Predicate<? super ItemStack> desired, boolean allowInventory) {
+    /** Whether throwaway() can place from the offhand: it needs a hotbar slot that is empty or holds a tool to select. */
+    private boolean offhandPlaceable(NonNullList<ItemStack> inv) {
+        for (int i = 0; i < 9; i++) {
+            final ItemStack item = inv.get(i);
+            if (item.isEmpty() || item.getItem().components().has(DataComponents.TOOL)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean throwaway(boolean select, Predicate<? super ItemStack> wanted, boolean allowInventory) {
         LocalPlayer p = ctx.player();
         NonNullList<ItemStack> inv = p.getInventory().getNonEquipmentItems();
+        // obsidian at or under obsidianReserve is not ours to place, whatever asks: HunterBuddy's regear builds its box
+        // out of it, and the box has to be built whole. The other blocks, or nothing.
+        final boolean obsidianToSpare = this.obsidianCount() > Baritone.settings().obsidianReserve.value;
+        final Predicate<ItemStack> desired = stack -> wanted.test(stack) && (obsidianToSpare || stack.getItem() != Items.OBSIDIAN);
         for (int i = 0; i < 9; i++) {
             ItemStack item = inv.get(i);
             // this usage of settings() is okay because it's only called once during pathing

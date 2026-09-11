@@ -1523,6 +1523,15 @@ public final class Settings {
     public final Setting<Integer> elytraTakeoffPillarMaxHeight = new Setting<>(12);
 
     /**
+     * Obsidian Baritone keeps back: once no more than this is left, obsidian is never picked as a block to place, by
+     * a pillar, a bridge or anything else, and the other {@link #acceptableThrowawayItems} are used or nothing is
+     * placed. HunterBuddy's regear builds its box out of 24 obsidian, and the box has to be built whole. The elytra
+     * takeoff also refuses a pillar it could only finish by going into this obsidian, and moves on to its next rung.
+     * {@code 0} keeps nothing back.
+     */
+    public final Setting<Integer> obsidianReserve = new Setting<>(25);
+
+    /**
      * The seed used to generate chunks for long distance elytra path-finding in the nether.
      * Defaults to 2b2t's nether seed.
      */
@@ -1610,6 +1619,14 @@ public final class Settings {
      * at the price of one more search per leg.
      */
     public final Setting<Integer> elytraPathLegLength = new Setting<>(128);
+
+    /**
+     * How many seconds in lava before the elytra stops being opened to get out of it and the bot walks out instead,
+     * to the nearest place to stand within a few blocks. The elytra gets out of lava deep enough to glide in within
+     * a few seconds; from a pool one block deep it never does, the floor of the pool shutting the elytra two ticks
+     * after every opening. {@code 0} walks out at once; a very large value keeps to the elytra.
+     */
+    public final Setting<Integer> elytraLavaWalkOutSeconds = new Setting<>(10);
 
     /**
      * Write a line per tick for the first moments of every takeoff: what the launch spot measured, where the

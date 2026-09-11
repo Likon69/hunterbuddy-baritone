@@ -45,6 +45,7 @@ import baritone.process.elytra.FlightLog;
 import baritone.process.elytra.NetherPathfinderContext;
 import baritone.process.elytra.NullElytraProcess;
 import baritone.utils.BaritoneProcessHelper;
+import baritone.utils.BlockStateInterface;
 import baritone.utils.PathingCommandContext;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongSet;
@@ -151,12 +152,16 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     /** How many times one takeoff may climb before admitting defeat. */
     private static final int MAX_CLIMBS = 2;
     /**
-     * How many 48-block legs towards the goal one takeoff may walk in all before admitting defeat.
+     * How many 48-block legs towards the goal in a row may get nowhere before the ladder admits defeat. A leg that
+     * gets to its point starts this count over: it ends on new ground, where the whole ladder is tried again,
+     * measured spots included.
      * <p>
-     * Each leg ends on new ground where the ladder starts over, measured spots included, so this is the cap that
-     * bounds the whole ladder. Without it a bot in solid rock would tunnel all the way to its goal, which was
-     * sixty thousand blocks away on the flights this was written for. Three legs is 144 blocks, well past any
-     * pocket the nether has shown so far: the one flight that ever needed a leg was flying again after the first.
+     * This used to count every leg, three in all, so that a bot in solid rock would not tunnel all the way to its
+     * goal, sixty thousand blocks away on the flights it was written for. That still does not happen: the goal only
+     * gives the legs their direction, and the digging stops at the first place a takeoff works from. But a bot that
+     * can still move no longer stands there after 144 blocks. The user's rule since 2026-09-11: it goes on to the
+     * next thing until it can fly, and tunnels on foot are fine. Only legs in a row that got nowhere - a walk that
+     * stalls, or one no path can be found for - still end the ladder.
      */
     private static final int MAX_ONWARD_LEGS = 3;
     /** How far the relocation search looks on its second, wider pass, and what that pass may spend. */
@@ -225,7 +230,10 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private static final float TAKEOFF_PINNED_SINK_PITCH = 40.0F;
     /** How far below a pinned glide has to be clear of lava before it is allowed to set itself down. */
     private static final int TAKEOFF_PINNED_SAFE_DROP = 12;
-    /** How far we have to move for the ladder to consider itself at a new spot and start over from the top. */
+    /**
+     * How far we have to move sideways, or drop, for the ladder to consider itself at a new spot and start over
+     * from the top.
+     */
     private static final int TAKEOFF_SAME_SPOT_RADIUS = 8;
     /** How long the ladder's memory of a spot survives with nothing happening. */
     private static final int TAKEOFF_MEMORY_TICKS = 20 * 180;
@@ -252,6 +260,24 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      */
     private static final int TAKEOFF_PATH_GRACE_TICKS = 20;
     private boolean lavaPathRequested;
+    /** How far from our feet the walk out of the lava looks for somewhere to stand. */
+    private static final int LAVA_EXIT_RADIUS = 5;
+    /** How long the walk may head for one place without getting closer to it before it tries another. */
+    private static final int LAVA_EXIT_STALL_TICKS = 60;
+    /** How long we may be out of the lava, bobbing at its surface, without that ending the stay in it. */
+    private static final int LAVA_OUT_GRACE_TICKS = 20;
+    /** When the current stay in lava began and when we were last in it, in player ticks; -1 when there is none. */
+    private int lavaSinceTick = -1;
+    private int lavaLastTick = -1;
+    /** Where the walk out of the lava is heading, and how close to it the walk has got. */
+    private BetterBlockPos lavaExit;
+    private double lavaExitClosest;
+    private int lavaExitProgressTick;
+    /** Places the walk out of the lava gave up on during this stay. */
+    private final Set<BetterBlockPos> lavaExitsTried = new HashSet<>();
+    private boolean lavaNoExitNoted;
+    /** When the walk out of the lava last looked for somewhere to go. */
+    private int lavaExitSearchTick;
     /** Whether this takeoff sequence has already climbed once. One climb per spot: a stance that still fails after it is walled in some other way height can't fix. */
     private boolean pillared;
     /** The feet-Y the current pillar is climbing to. */
@@ -321,6 +347,8 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
     /** Legs walked towards the goal since the last takeoff that worked; see {@link #MAX_ONWARD_LEGS}. */
     private int onwardLegs;
+    /** Whether the walk in progress is a leg towards the goal, rather than a walk to measured spots. */
+    private boolean walkingOnwards;
     /**
      * Every rocket a behavior has lit, whichever behavior it was: the process outlives them, and one is rebuilt
      * mid flight to go to a landing spot.
@@ -386,6 +414,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         this.takeoffBoostPending = false;
         this.takeoffOpenedTicksAgo = -1;
         this.lavaPathRequested = false;
+        forgetLava();
         this.pillarTargetY = 0;
         destroyBehaviorAsync();
     }
@@ -444,6 +473,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             trackFall();
         }
 
+        trackLava();
         if (!ctx.player().isFallFlying() && ctx.player().isInLava()) {
             return lavaTakeoff();
         }
@@ -455,7 +485,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 // asking for the same climb again.
                 this.takeoffStage = Stage.RELOCATE;
             } else if (this.state == State.WALK_TO_LAUNCH) {
-                this.takeoffStage = Stage.EXHAUSTED;
+                walkGotNowhere();
             }
             if (this.state == State.LOCATE_JUMP || this.state == State.GET_TO_JUMP
                     || this.state == State.PILLAR_UP || this.state == State.WALK_TO_LAUNCH) {
@@ -819,8 +849,21 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         if (this.state == State.WALK_TO_LAUNCH) {
             final BetterBlockPos feet = ctx.playerFeet();
             if (this.goal != null && ctx.player().onGround() && this.goal.isInGoal(feet.x, feet.y, feet.z)) {
-                // Arrived somewhere that measured as launchable. It is a different spot, so the ladder starts
-                // over from the top there, ledge search included - that is still the cheapest takeoff there is.
+                // Arrived: at a spot that measured as launchable, or at the end of a leg. It is a different spot,
+                // so the ladder starts over from the top there, ledge search included - that is still the
+                // cheapest takeoff there is. Here and now, rather than left to rememberTakeoffSpot, which reads a
+                // spot within its radius of the last one - the nearer measured spots, or a leg cut short by the
+                // destination - as the same spot, and carried on at the RELOCATE rung without ever launching from
+                // where it had walked to. The user's rule: when the position has changed, there is something to do.
+                if (this.walkingOnwards) {
+                    // a leg that got there: see MAX_ONWARD_LEGS, only legs that get nowhere count
+                    this.onwardLegs = 0;
+                }
+                FlightLog.log(String.format(Locale.ROOT,
+                        "spot: %s, reached by %s, is a new spot; the ladder starts at the top, with %d relocations, %d climbs and %d legs already spent",
+                        feet, this.walkingOnwards ? "a leg towards the goal" : "a walk to a measured spot",
+                        this.relocations, this.climbs, this.onwardLegs));
+                ladderStartsAt(feet, ctx.player().tickCount);
                 baritone.getPathingBehavior().secretInternalSegmentCancel();
                 this.goal = null;
                 this.walkOffImpossible = false;
@@ -835,13 +878,13 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 this.takeoffStallTicks = 0;
             } else if (++this.takeoffStallTicks > TAKEOFF_STALL_TICKS) {
                 this.goal = null;
-                this.takeoffStage = Stage.EXHAUSTED;
+                walkGotNowhere();
                 return standingTakeoff();
             }
             if (takeoffNoProgress()) {
                 logDirect("Not getting any closer to a spot to take off from, giving up on the walk.");
                 this.goal = null;
-                this.takeoffStage = Stage.EXHAUSTED;
+                walkGotNowhere();
                 return standingTakeoff();
             }
             return new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH);
@@ -1080,6 +1123,14 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             logDebug("walled in, but there's nothing to pillar with");
             return null;
         }
+        final int spare = baritone.getInventoryBehavior().spendableThrowawayCount();
+        if (lift > spare) {
+            // the obsidian under obsidianReserve is kept for the regear's box, which has to be built whole: a pillar
+            // only gets the other blocks and the obsidian over it, and one it could not finish is not started
+            FlightLog.log(String.format(Locale.ROOT, "climb: refused %d blocks up from %s, only %d blocks to spare over the %d obsidian kept for the regear box",
+                    lift, feet, spare, Baritone.settings().obsidianReserve.value));
+            return null;
+        }
         this.pillared = true;
         this.climbs++;
         this.pillarTargetY = feet.y + lift;
@@ -1107,7 +1158,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         // for, the eleven spots offered after a failed launch were all within seven blocks of it. Giving up at
         // that point, as this used to, leaves the ladder nothing but the abort. So past it the only relocation
         // left is the one that goes somewhere new: on towards the goal, digging if it has to, for a leg that
-        // ends on unmeasured ground and starts this count over - MAX_ONWARD_LEGS of them at most.
+        // ends on unmeasured ground and starts this count over - until MAX_ONWARD_LEGS of them in a row get nowhere.
         final boolean spotsSpent = this.relocations >= MAX_RELOCATIONS;
         List<Goal> spots = Collections.emptyList();
         this.lastSpotsSkipped = 0;
@@ -1124,6 +1175,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             this.goal = new GoalComposite(spots.toArray(new Goal[0]));
             what = "walking to one of " + spots.size() + " spots that will work";
             this.relocations++;
+            this.walkingOnwards = false;
         } else {
             // Nothing measured as launchable anywhere in range, which in a cave system is perfectly possible.
             // Set off towards the destination on foot and ask again from there.
@@ -1135,7 +1187,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             // y=103 and had it airborne again half a minute later, for five thousand more blocks. Crude and
             // working beats tidy and stuck.
             if (this.onwardLegs >= MAX_ONWARD_LEGS) {
-                // see MAX_ONWARD_LEGS: past this it is no longer a way out of a pocket, it is a tunnel
+                // see MAX_ONWARD_LEGS: that many legs in a row got nowhere, and the next one would go the same way
                 return null;
             }
             final Goal onwards = walkOnwardsGoal(feet);
@@ -1144,6 +1196,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             }
             this.goal = onwards;
             this.onwardLegs++;
+            this.walkingOnwards = true;
             // it ends on ground nobody has measured yet, which gets its own two walks to measured spots
             this.relocations = 0;
             what = (spotsSpent
@@ -1162,6 +1215,21 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                         : "",
                 this.goal));
         return new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH);
+    }
+
+    /**
+     * The walk in progress got nowhere: it stalled, or no path to it could be found. The measured spots are as good
+     * as spent, since measuring again from here hands back the same ground, so the next rung walks on towards the
+     * goal instead. A leg that got nowhere keeps its place in the {@link #MAX_ONWARD_LEGS} count, and past that the
+     * ladder ends.
+     * <p>
+     * This used to end the ladder outright. In the flight that changed it, the walk to six measured spots stalled
+     * ten blocks out, and the ladder gave up with a walk and all three legs still unspent. The user's rule: a bot
+     * that is stuck goes on to the next thing.
+     */
+    private void walkGotNowhere() {
+        this.relocations = MAX_RELOCATIONS;
+        this.takeoffStage = Stage.RELOCATE;
     }
 
     /** A point {@link #TAKEOFF_WALK_ONWARDS} blocks towards the destination, or {@code null} without one. */
@@ -1209,33 +1277,45 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      * Starts the ladder over when {@code feet} is somewhere other than where it was last run, or when it has
      * been working the same spot long enough that the terrain around it is worth re-reading.
      * <p>
-     * Horizontal distance only, and the clock is stamped when the spot changes rather than on every call.
-     * Both matter: measuring in three dimensions made a climb read as a new spot and cleared the one-climb
-     * rule with it, and re-stamping every tick - which is every tick, since this runs from the state that
-     * loops - meant the expiry could never elapse and a spot that reached the end of the ladder stayed there
-     * for the rest of the session.
+     * Horizontal distance and a drop, not a rise, and the clock is stamped when the spot changes rather than on
+     * every call. All of it matters: measuring in three dimensions made a climb read as a new spot and cleared the
+     * one-climb rule with it, and re-stamping every tick - which is every tick, since this runs from the state that
+     * loops - meant the expiry could never elapse and a spot that reached the end of the ladder stayed there for
+     * the rest of the session. A drop counts since the flight where the ladder gave up at y=74 and the bot then
+     * fell 38 blocks straight down into open ground: every restart down there aborted at once on what had been
+     * measured up there, a four-block climb away from a takeoff it never tried. The user's rule: when the position
+     * has changed, there is something to do.
      */
     private void rememberTakeoffSpot(BetterBlockPos feet) {
         final int now = ctx.player().tickCount;
         final int dx = this.takeoffSpot == null ? 0 : this.takeoffSpot.x - feet.x;
         final int dz = this.takeoffSpot == null ? 0 : this.takeoffSpot.z - feet.z;
+        final int drop = this.takeoffSpot == null ? 0 : this.takeoffSpot.y - feet.y;
         final boolean sameSpot = this.takeoffSpot != null
                 && dx * dx + dz * dz <= TAKEOFF_SAME_SPOT_RADIUS * TAKEOFF_SAME_SPOT_RADIUS
+                && drop <= TAKEOFF_SAME_SPOT_RADIUS
                 && now - this.takeoffSpotTick < TAKEOFF_MEMORY_TICKS;
         if (sameSpot) {
             return;
         }
         // Relocations, climbs and legs are not reset here, even when the memory has expired: only a takeoff that
-        // worked resets them. Resetting them on expiry would hand a full ladder back to every restart after a
-        // regear or a pause, which in a real trap is rockets spent for nothing.
+        // worked resets them, and a leg that got to its point its own count. Resetting them on expiry would hand a
+        // full ladder back to every restart after a regear or a pause, which in a real trap is rockets spent for
+        // nothing.
         final boolean expired = this.takeoffSpot != null && now - this.takeoffSpotTick >= TAKEOFF_MEMORY_TICKS;
         FlightLog.log(this.takeoffSpot == null
                 ? "spot: taking off from " + feet + ", the ladder starts at the top"
                 : String.format(Locale.ROOT,
                         "spot: %s is a new spot, %.0f blocks from the last one%s; the ladder starts at the top, with %d relocations, %d climbs and %d legs already spent",
                         feet, Math.sqrt(dx * dx + dz * dz),
-                        expired ? ", whose memory had expired" : "",
+                        drop > TAKEOFF_SAME_SPOT_RADIUS ? " and " + drop + " blocks below it"
+                                : expired ? ", whose memory had expired" : "",
                         this.relocations, this.climbs, this.onwardLegs));
+        ladderStartsAt(feet, now);
+    }
+
+    /** The ladder starts over from the top at {@code feet}: its rungs, and the launches and climb of one spot. */
+    private void ladderStartsAt(BetterBlockPos feet, int now) {
         this.takeoffStage = Stage.LAUNCH;
         this.standingTakeoffs = 0;
         this.pillared = false;
@@ -1794,7 +1874,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      * is far too slow, and since vanilla moves us by the fluid rules while we are in one, glide or not, the
      * rocket is the only thrust there is and keeps a fraction of its usual push. Pointing it at the pool's wall
      * would spend all of that on basalt, so once the elytra is open {@link ElytraBehavior} aims straight up and
-     * keeps lighting rockets until we are out.
+     * keeps lighting rockets until we are out. None of that gets out of a pool too shallow to glide in, whose
+     * floor shuts the elytra two ticks after it opens: after {@link #lavaWalkOutTicks} in lava this walks out
+     * instead, see {@link #walkOutOfLava}.
      */
     private PathingCommand lavaTakeoff() {
         baritone.getPathingBehavior().secretInternalSegmentCancel();
@@ -1806,11 +1888,194 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             this.lavaPathRequested = true;
             this.behavior.pathManager.pathToDestination(launchPathStart(ctx.playerFeet()));
         }
+        if (ctx.player().tickCount - this.lavaSinceTick >= lavaWalkOutTicks()) {
+            final PathingCommand out = walkOutOfLava();
+            if (out != null) {
+                return out;
+            }
+            // nowhere to walk to: the elytra is all there is
+        }
         if (!ctx.player().onGround() && openElytra()) {
             this.state = State.START_FLYING;
             this.takeoffStallTicks = 0;
         }
         return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+    }
+
+    /**
+     * How long a stay in lava lasts before the lava takeoff stops opening the elytra and walks out instead, from
+     * {@link baritone.api.Settings#elytraLavaWalkOutSeconds}: ten seconds by default, the user's figure. The elytra
+     * gets out of a pool deep enough to open it in within a few seconds, the lava sea included. From a pool one block
+     * deep it never does: the elytra shuts on the floor of the pool two ticks after every opening, which at 6770156
+     * 101 2932664 went on for over two minutes, sixty-odd openings, with every rocket lit into the wall and ignored by
+     * the server, until the user stopped it. In ticks, and in a long, so that a setting large enough to mean "never"
+     * does not overflow into "at once".
+     */
+    private static long lavaWalkOutTicks() {
+        return 20L * Math.max(0, Baritone.settings().elytraLavaWalkOutSeconds.value);
+    }
+
+    /**
+     * Keeps the account of the current stay in lava for {@link #lavaTakeoff}: when it began, and the line in the
+     * flight record when a walk out of it gets us out. A stay begins in lava with the elytra shut: a flight that
+     * skims a lava lake is not stuck, and must not have used up the time by the moment it ends in a pool. Once begun,
+     * it lasts as long as we are in lava, gliding or not, and a second out of it - bobbing out at the surface - does
+     * not end it either: every opening of the elytra off the floor of a pool would restart the clock otherwise, and
+     * one that burns a whole rocket before falling back in would keep the stay from ever reaching its end.
+     */
+    private void trackLava() {
+        final int now = ctx.player().tickCount;
+        if (ctx.player().isInLava()) {
+            if (this.lavaSinceTick < 0 || now < this.lavaLastTick || now - this.lavaLastTick > LAVA_OUT_GRACE_TICKS) {
+                forgetLava();
+                if (ctx.player().isFallFlying()) {
+                    return;
+                }
+                this.lavaSinceTick = now;
+            }
+            this.lavaLastTick = now;
+        } else if (this.lavaExit != null && now - this.lavaLastTick > LAVA_OUT_GRACE_TICKS) {
+            FlightLog.log(String.format(Locale.ROOT, "lava: out on foot at %s, %.1f s after getting in",
+                    ctx.playerFeet(), (this.lavaLastTick - this.lavaSinceTick) / 20.0));
+            this.lavaExit = null;
+        }
+    }
+
+    private void forgetLava() {
+        this.lavaSinceTick = -1;
+        this.lavaLastTick = -1;
+        this.lavaExit = null;
+        this.lavaExitsTried.clear();
+        this.lavaNoExitNoted = false;
+    }
+
+    /**
+     * Walks out of the lava to the nearest place to stand, once {@link #lavaWalkOutTicks} in it have shown that
+     * the elytra will not get us out: facing it, forward, with the jump {@link #lavaTakeoff} already holds. Vanilla
+     * lifts anyone walking into a ledge from inside a fluid onto it when there is room above, so the rim of the
+     * pool one block up is as good as flat ground. No elytra and no rocket meanwhile: in the pool this was written
+     * for, the rockets went into a wall, and the server ignored them anyway, the elytra being shut again by the
+     * time they reached it.
+     *
+     * @return {@code null} when there is nowhere within {@link #LAVA_EXIT_RADIUS} blocks to walk to
+     */
+    private PathingCommand walkOutOfLava() {
+        final int now = ctx.player().tickCount;
+        final Vec3 pos = ctx.player().position();
+        if (this.lavaExit != null) {
+            final double left = Math.hypot(this.lavaExit.x + 0.5 - pos.x, this.lavaExit.z + 0.5 - pos.z);
+            if (left < this.lavaExitClosest - 0.5) {
+                this.lavaExitClosest = left;
+                this.lavaExitProgressTick = now;
+            } else if (now - this.lavaExitProgressTick > LAVA_EXIT_STALL_TICKS) {
+                FlightLog.log("lava: no closer to " + this.lavaExit + " in " + LAVA_EXIT_STALL_TICKS / 20 + " s, trying somewhere else");
+                this.lavaExitsTried.add(this.lavaExit);
+                this.lavaExit = null;
+            }
+        }
+        if (this.lavaExit == null) {
+            if (this.lavaNoExitNoted && now - this.lavaExitSearchTick < LAVA_EXIT_STALL_TICKS) {
+                // the last look found nothing: not a whole search every tick meanwhile, only every few seconds
+                return null;
+            }
+            this.lavaExitSearchTick = now;
+            final BetterBlockPos feet = ctx.playerFeet();
+            this.lavaExit = findLavaExit(feet);
+            if (this.lavaExit == null) {
+                if (!this.lavaNoExitNoted) {
+                    this.lavaNoExitNoted = true;
+                    FlightLog.log("lava: nowhere to stand within " + LAVA_EXIT_RADIUS + " blocks of " + feet + ", back to the elytra");
+                }
+                return null;
+            }
+            this.lavaExitClosest = Math.hypot(this.lavaExit.x + 0.5 - pos.x, this.lavaExit.z + 0.5 - pos.z);
+            this.lavaExitProgressTick = now;
+            FlightLog.log(String.format(Locale.ROOT, "lava: %.1f s in lava at %s without getting out, walking to %s (%s, %.1f blocks)",
+                    (now - this.lavaSinceTick) / 20.0, feet, this.lavaExit,
+                    this.lavaExit.y > feet.y ? "one block up" : "level", this.lavaExitClosest));
+        }
+        final Rotation towards = RotationUtils.calcRotationFromVec3d(ctx.playerHead(), Vec3.atCenterOf(this.lavaExit), ctx.playerRotations());
+        baritone.getLookBehavior().updateTarget(new Rotation(towards.getYaw(), 0), false);
+        baritone.getInputOverrideHandler().setInputForceState(Input.MOVE_FORWARD, true);
+        return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+    }
+
+    /**
+     * The nearest place to stand out of the lava within {@link #LAVA_EXIT_RADIUS} blocks of {@code feet}, level with
+     * them or one block up, that a straight walk through the pool gets to; of the nearest ones, the one most towards
+     * the destination. {@code null} if there is none.
+     */
+    private BetterBlockPos findLavaExit(final BetterBlockPos feet) {
+        final BlockStateInterface bsi = new BlockStateInterface(ctx);
+        final BetterBlockPos dest = this.behavior != null ? this.behavior.destination : null;
+        final double toDestX = dest == null ? 0 : dest.x - feet.x;
+        final double toDestZ = dest == null ? 0 : dest.z - feet.z;
+        final double toDest = Math.max(1, Math.hypot(toDestX, toDestZ));
+        BetterBlockPos best = null;
+        double bestScore = 0;
+        for (int r = 1; r <= LAVA_EXIT_RADIUS && best == null; r++) {
+            for (int dx = -r; dx <= r; dx++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != r) {
+                        continue;
+                    }
+                    for (int dy = 0; dy <= 1; dy++) {
+                        final BetterBlockPos spot = new BetterBlockPos(feet.x + dx, feet.y + dy, feet.z + dz);
+                        if (this.lavaExitsTried.contains(spot) || !standsOutOfLava(bsi, spot) || !wadesTo(feet, spot)) {
+                            continue;
+                        }
+                        // the cosine of the angle to the destination: towards it first, and without one, any
+                        final double score = (dx * toDestX + dz * toDestZ) / (Math.hypot(dx, dz) * toDest);
+                        if (best == null || score > bestScore) {
+                            best = spot;
+                            bestScore = score;
+                        }
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /** Room to stand at {@code spot}, out of the lava, on something that holds us. */
+    private boolean standsOutOfLava(final BlockStateInterface bsi, final BetterBlockPos spot) {
+        // canWalkOn takes lava for a floor when assumeWalkOnLava is on
+        return MovementHelper.fullyPassable(ctx, spot)
+                && MovementHelper.fullyPassable(ctx, spot.above())
+                && !MovementHelper.isLava(bsi.get0(spot.x, spot.y - 1, spot.z))
+                && MovementHelper.canWalkOn(bsi, spot.x, spot.y - 1, spot.z, bsi.get0(spot.x, spot.y - 1, spot.z));
+    }
+
+    /**
+     * Whether nothing solid stands between {@code feet} and the column of {@code spot} at the height of our feet and
+     * of our head, across the width of our body: only lava, which we wade through, or air. The width is what stops a
+     * diagonal step between two blocks that touch at a corner, which the line alone slips through.
+     */
+    private boolean wadesTo(final BetterBlockPos feet, final BetterBlockPos spot) {
+        final double dx = spot.x - feet.x;
+        final double dz = spot.z - feet.z;
+        final double length = Math.hypot(dx, dz);
+        // a third of a block either side of the line, the half-width of the player and then some
+        final double sideX = -dz / length * 0.3;
+        final double sideZ = dx / length * 0.3;
+        final int steps = (int) Math.ceil(length * 4);
+        for (int i = 1; i < steps; i++) {
+            for (int side = -1; side <= 1; side++) {
+                final int x = (int) Math.floor(feet.x + 0.5 + dx * i / steps + sideX * side);
+                final int z = (int) Math.floor(feet.z + 0.5 + dz * i / steps + sideZ * side);
+                if (x == spot.x && z == spot.z || x == feet.x && z == feet.z) {
+                    continue;
+                }
+                // our feet and our head, and for a spot one block up the height the head rises to on the way onto it
+                for (int y = feet.y; y <= spot.y + 1; y++) {
+                    final BlockPos at = new BlockPos(x, y, z);
+                    if (!MovementHelper.fullyPassable(ctx, at) && !MovementHelper.isLava(ctx.world().getBlockState(at))) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     /**
