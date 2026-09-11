@@ -5,7 +5,7 @@ HunterBuddy Meteor addon needs for long-distance elytra flight in the nether on 
 below is in the elytra code; nothing else in Baritone is touched.
 
 Built with `./gradlew :fabric:build -Pmod_version=1.3.0-hbN-1.21.11`, output in
-`dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb27**.
+`dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb29**.
 
 To see anything the elytra code logs, both of `#elytraChatSpam true` and `#chatDebug true` are
 needed - the verbose lines go through `logDebug`, which the second setting gates.
@@ -214,6 +214,82 @@ rather than spend it. `0` keeps nothing back, the old behaviour.
 
 ---
 
+## 13. Turn away from a hazard the rescue can't out-climb or out-dive
+
+`ElytraBehavior.solveSurvival`'s last-resort pitch sweep only ever changed pitch: when the current heading could
+not clear the whole simulated horizon (`elytraSimulationTicks`), the best it could do was climb or dive into
+whatever was there, because a hazard that spans the flight path front-on has no pitch that gets past it, only a
+heading that goes around it. Measured on two two-hour hb27 flights: 367-423 wall and ceiling hits each, almost
+all of them this exact shape - the "not yet true" this fork's own status section used to name.
+
+The sweep now keeps the current heading first: a straight pitch scan that survives the whole horizon behaves
+exactly as before, nothing else runs. Only when it doesn't does the rescue also try yaw offsets of ±30, ±60 and
+±90 degrees, in that order, stopping at the first one whose own pitch sweep survives the full horizon. A turned
+heading is only adopted over whatever is currently best if it survives at least 2 ticks longer, so two options
+that are near enough equal don't make the yaw flap between them from one tick to the next. Whichever heading
+wins carries into the forced-firework branch too, so a rocket lit to escape is not lit back into the same wall
+the turn just went around. Logged once per turn adopted (`solver: turning N degrees off the heading...`), not
+once for every tick it stays adopted.
+
+Not yet flown for real, so whether it actually cuts down the wall-hit count above is still an open question, not
+a measured result.
+
+## 14. Count a launch that falls straight back down against the same spot
+
+Measured across the flights behind §2: a standing launch that opens the elytra, meets whatever boxes the pocket
+in, and falls back down lands 13-18 blocks out and 10-12 blocks below where it jumped from - past
+`rememberTakeoffSpot`'s existing 8-block/8-drop window for "same spot", so it read as new ground every time. The
+ladder restarted at the top with launches 0/3 and repeated the identical failed launch a second time: two
+minutes lost across two such loops in the flights this was measured on.
+
+`rememberTakeoffSpot` now also treats a landing as the same spot when the flight that just ended was a launch
+made at the `LAUNCH` rung (`launchedFromSpot`, set in `flightStarted` and read back once), the memory of that
+spot is still fresh, the landing is within `TAKEOFF_SUCCESS_DISTANCE` (32 blocks) horizontally, and the drop is
+at most twice `TAKEOFF_SAME_SPOT_RADIUS` (16 blocks). The drop is capped tighter than the horizontal distance on
+purpose: a real fall to new ground - the 38-block drop `rememberTakeoffSpot`'s own comment already tells of -
+still starts the ladder over, as it should. The launch count needed no new bookkeeping: `launchFromHere` already
+increments `standingTakeoffs` at the moment of the attempt, not on a successful restart, so simply not resetting
+the ladder is the whole fix. A third failed launch from the same spot still escalates to the `CLIMB` rung exactly
+as a third failure always did - this changes what counts as the same spot, not the three-launch cap itself.
+
+## 15. Lock the nether-pathfinder chunk cache against a native crash
+
+Two `EXCEPTION_ACCESS_VIOLATION` crashes in `nether_pathfinder.dll` (the bundled `dev.babbaj:nether-pathfinder`
+v1.4.1, jar-in-jar) traced back to `Context::cacheMutex` not being held on every access to the native chunk hash
+map: `getOrCreateChunk` (the JNI entry point) takes it, but `getChunkOrAir` (read on every A* node inside
+`findPathSegment`) and the `findAir` search used to locate a start/goal air cell (through `getChunkNoMutex`,
+named for exactly this) did not, while chunk generation running on the parallel executor threads inserts into
+the same map under the lock. A reader running unlocked while a writer holds the lock on another thread corrupts
+the hash table.
+
+Both unlocked paths now take `cacheMutex` for the duration of the lookup (`PathFinder.cpp`, in `getChunkOrAir`
+and in the `findAir` loop body). `cullFarChunks`'s `erase_if` was already locked in the 1.4.1 source, so it
+needed no change. Neither call site holds the lock while calling anything that also locks it, so there is no
+deadlock.
+
+The DLL is rebuilt from the upstream `v1.4.1` tag with only that lock added, plus build-only accommodations to
+get the source through MSVC/CMake instead of the zig-cc/clang toolchain upstream actually ships with (no clang
+toolchain was available here to build with instead): a `noinline` macro that avoids GCC's `__attribute__`
+syntax, a missing `<algorithm>` include, and making `Path` a move-only type instead of a copy-attempting
+aggregate so MSVC's STL stops trying to instantiate a deleted `unique_ptr` copy constructor. None of these
+change behavior or the JNI ABI. The DLL is also linked against the static MSVC runtime
+(`CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`, i.e. `/MT`) instead of the default `/MD`: the upstream zig-cc build
+carries its own runtime, but an `/MD` rebuild would depend on MSVCP140.dll/VCRUNTIME140.dll, which is not
+guaranteed to be present on a machine without the VC++ redistributable installed. `dumpbin /DEPENDENTS` on the
+result now lists only `KERNEL32.dll`. The patched DLL replaces only the Windows x64 binary inside the jar's
+`natives.zip.xz`; nothing else in that archive or in the jar's classes changed. `gradle.properties` and the
+root `build.gradle` now resolve `dev.babbaj:nether-pathfinder` to that patched jar
+(`libs/nether-pathfinder-1.4.1-hbpatched.jar`, via a `flatDir` repository) instead of the upstream release; the
+`include` in `fabric/build.gradle` that jars it into the mod is untouched.
+
+Exercised outside the mod with the tag's own `main.cpp` test harness (`-DTESTING=ON`), against the patched
+source built the same way: the default run (seed `146008555100680`, mostly fake-air chunks) and a second run
+forcing real per-seed chunk generation across the parallel executor threads both complete cleanly and
+repeatably, no deadlock or crash, a path found each time.
+
+Built into hb29. Not yet flown in the mod itself - this closes the two crashes diagnosed from hs_err logs and
+source, and the lock has now run standalone, but nothing here has run inside a live Baritone session yet.
+
 ## Settings added by this fork
 
 | Setting | Default | What it does |
@@ -245,10 +321,19 @@ for 18 ticks against tight terrain and recovered on its own inside one second, w
 fireworked-recovery path (§7's simulation feeding it a trajectory to raytrace) doing what it is for, not a
 gap in the takeoff ladder.
 
-What is not yet true: the ladder's rescue still only ever adjusts pitch, never yaw, so a spot that needs a
-turn rather than a climb or a dive can still be clipped before the main solver finds a real path again -
-measured as the near-totality of this fork's wall and ceiling hits, concentrated in exactly the flights that
-hit a lost-pitch moment at all. Not fixed yet.
+What is not yet true: the ladder's rescue used to only ever adjust pitch, never yaw, so a spot that needed a
+turn rather than a climb or a dive was clipped before the main solver could find a real path again - measured
+as the near-totality of this fork's wall and ceiling hits, concentrated in exactly the flights that hit a
+lost-pitch moment at all. hb28 has the rescue try turning as well (§13), but that has not flown yet, so whether
+it actually brings the wall-hit count down is still unmeasured, not established. And the turn search itself is
+six discrete headings, ±30/±60/±90 degrees off the current one, not a continuous scan: a hazard that only
+clears at some other angle, or that would need more than a 90-degree turn to get around, still gets nothing
+better than the old pitch-only answer.
+
+Also unmeasured in flight: hb28's fix for a standing launch that falls straight back down being read as a new
+spot and restarting the ladder (§14). The mechanism is a straightforward relaxation of an existing same-spot
+check, but "does it actually stop the double-loop measured in hb27" is a question for the next long run, the
+same as §13.
 
 `nether_pathfinder.dll` (the native chunk pathfinder this fork inherits, not written here) has crashed the
 game once, reading an address of `-1` out of `getOrCreateChunk`, in the middle of a burst of path

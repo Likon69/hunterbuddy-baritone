@@ -48,6 +48,9 @@ allprojects {
     }
 
     repositories {
+        flatDir {
+            dirs "${rootDir}/libs"
+        }
         maven {
             url = "https://files.minecraftforge.net/maven/"
         }
