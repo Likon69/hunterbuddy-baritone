@@ -1,11 +1,11 @@
-# HunterBuddy fork of dekrom/baritone
+# hunterbuddy-baritone
 
 A fork of dekrom's Baritone (`v1.3.0-1.21.11`, Mojang mappings) carrying the changes the
 HunterBuddy Meteor addon needs for long-distance elytra flight in the nether on 2b2t. Everything
 below is in the elytra code; nothing else in Baritone is touched.
 
 Built with `./gradlew :fabric:build -Pmod_version=1.3.0-hbN-1.21.11`, output in
-`dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb12**.
+`dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb27**.
 
 To see anything the elytra code logs, both of `#elytraChatSpam true` and `#chatDebug true` are
 needed - the verbose lines go through `logDebug`, which the second setting gates.
@@ -139,6 +139,79 @@ mid-flight leaves a value behind; the mod that sets them is expected to clear th
 
 `elytraPathColor` (default red) instead of the hardcoded colour.
 
+## 9. Recognise a fall, and never stop while an option is left
+
+`rememberTakeoffSpot` decided whether the ladder was still working the same spot, or had to start over at the
+top, by horizontal distance alone. In the flight that changed it, the ladder gave up at y=74 - the ladder is
+allowed to give up on a *spot*, once every rung has failed there - and the bot then fell 38 blocks straight
+down into open ground. Every restart down there measured in three dimensions as the same spot it had already
+exhausted, and aborted at once, a four-block climb away from a takeoff it never tried.
+
+- A takeoff spot is remembered by horizontal distance **and drop**: more than `TAKEOFF_SAME_SPOT_RADIUS` (8
+  blocks) sideways or below counts as a new spot, and the ladder starts over at `LAUNCH`. A climb is still the
+  same spot as the ground it climbed from - only measuring three-dimensional distance without excluding rises
+  broke that, and cleared the one-climb rule with it.
+- `walkGotNowhere()` used to end the ladder outright when a walk stalled or found no path. The measured spots
+  are as good as spent by then, since measuring again from the same ground hands back the same answer - so the
+  ladder now moves on to `RELOCATE` instead, which walks onward towards the destination. The user's rule: a bot
+  that is stuck goes on to the next thing.
+- Walking onward is capped at `MAX_ONWARD_LEGS` (3) legs in a row that get nowhere, not 3 legs total - a leg
+  that actually arrives resets the count, so a bot making real progress in short hops is never cut off
+  mid-journey. Digging happens only along these legs, to reach a spot the ladder can try from - never towards
+  the destination itself.
+- Every arrival - a measured spot reached, or a leg that got there - restarts the ladder at the top
+  (`ladderStartsAt`) via the same path `rememberTakeoffSpot` already takes for a genuinely new spot. A spot
+  within `TAKEOFF_SAME_SPOT_RADIUS` used to be read as the one already being worked and never launched from
+  again once that spot's rungs had run out.
+
+## 10. Keep a heading across a long, straight destination
+
+The native pathfinder only steps along six axes, and its search is drawn towards the goal by straight-line
+distance, which dominates the cost of a step enough to make the search close to greedy. Aimed straight at a
+destination far away, along an axis at all, the path runs along that axis and only turns once the remaining
+distance sits at 45 degrees to it, however far out that turn ends up being - a bot asked to fly at 22 degrees
+off the +X axis, towards the middle of the nether highway grid, flew the axis itself for tens of thousands of
+blocks before the last leg of the journey turned onto the real heading.
+
+`elytraPathLegLength` (128 blocks) aims every search that is not already within that distance of the
+destination at a point on the straight line towards it instead of at the destination itself - past the chunks
+the client has loaded, with the same margin the old destination-only search got from flying only through
+loaded terrain. The path still runs along an axis at the start of each leg and turns onto the diagonal by its
+end, but only within that one leg: it strays at most about a fifth of a leg's length off the true line, and
+the next leg starts over from wherever this one actually ended, correcting any drift before it can compound.
+Shorter legs hold the heading more closely, at the price of one more search per leg. `0` aims every search at
+the destination, the old behaviour.
+
+## 11. Walk out of a lava puddle the elytra can never leave
+
+An elytra opens in lava - vanilla only refuses it in water - and a rocket lit straight up is what gets a bot
+out of a lake or a sea within a few seconds. It does not get a bot out of a puddle one block deep: the floor
+shuts the elytra again two ticks after every opening, before a rocket's thrust has done anything. In the
+flight that changed it, this ran for over two minutes and sixty-odd openings, every rocket lit into the wall
+of the pool and ignored by the server, until the user stopped it by hand.
+
+`elytraLavaWalkOutSeconds` (10, the user's figure) tracks how long the current stay in lava has lasted -
+started when a stay in lava begins with the elytra shut, so a flight that only skims a lake is never charged
+for it, and kept running for as long as the bot is in lava at all, gliding or not, so an opening that bobs it
+to the surface for a moment does not reset the clock either. Past that many seconds, the elytra stops being
+opened and the bot walks out on foot instead, to the nearest place to stand within `LAVA_EXIT_RADIUS` blocks -
+vanilla lifts a player walking into a ledge from inside a fluid onto it when there is room above, so the rim of
+the pool one block up is as good as flat ground to walk onto. `0` walks out at once; a very large value keeps
+to the elytra always.
+
+## 12. Keep obsidian back for the regear box
+
+HunterBuddy's regear lands, builds a box out of 24 obsidian to hold what it restocks, and has to build that box
+whole or not at all. Nothing in Baritone itself knew that: a pillar, a bridge, or the elytra takeoff's own climb
+would spend obsidian down to nothing if that was the only throwaway block left, leaving the regear with less
+than a box's worth the next time it needed one.
+
+`obsidianReserve` (25) is obsidian Baritone will not touch for any of that: once no more than this much is
+left, obsidian is never chosen as a block to place, by a pillar, a bridge or anything else, and the other
+`acceptableThrowawayItems` are used instead, or nothing is placed at all. The elytra takeoff's climb rung
+(`CLIMB`, §2) refuses a pillar it could only finish by going into the reserve, and moves on to its next rung
+rather than spend it. `0` keeps nothing back, the old behaviour.
+
 ---
 
 ## Settings added by this fork
@@ -156,16 +229,37 @@ mid-flight leaves a value behind; the mod that sets them is expected to clear th
 | `elytraLandingBastionRadius` | `48` | Piglin brute radius that rejects a landing spot |
 | `elytraFireworkBoostMultiplier` | `1.5` | Firework acceleration the flight simulation assumes |
 | `elytraFireworkExtraBoostTicks` | `0` | Ticks a boost lasts beyond the rocket's own lifetime |
+| `elytraPathLegLength` | `128` | How far ahead a search aims on a long, straight destination, in blocks |
+| `elytraLavaWalkOutSeconds` | `10` | Seconds in lava before the takeoff gives up on the elytra and walks out |
+| `obsidianReserve` | `25` | Obsidian never spent by a pillar, a bridge or anything else Baritone places |
 
 Note that `elytraFireworkSpeed` is an older, unrelated setting: the minimum speed below which a firework
 is deployed, not an acceleration.
 
 ## Status
 
-None of this has been tested against a full nether crossing end to end. The takeoff ladder has been seen
-to dig its way out of a closed hole and carry on, which is what it was written for; on that same flight
-it then started the elytra path on the far side of a wall, which is what the line-of-sight test in
-section 2 was added for and has not been flown since.
+Flown for real, at length, in HunterBuddy's own long-distance runs - not just the incidents each section
+above was written against. The longest single test so far: just over two hours unattended, 213,915 blocks,
+42 takeoffs, zero abandoned. The one flight that struggled hardest in that run lost a valid pitch solution
+for 18 ticks against tight terrain and recovered on its own inside one second, which is the solver's own
+fireworked-recovery path (§7's simulation feeding it a trajectory to raytrace) doing what it is for, not a
+gap in the takeoff ladder.
+
+What is not yet true: the ladder's rescue still only ever adjusts pitch, never yaw, so a spot that needs a
+turn rather than a climb or a dive can still be clipped before the main solver finds a real path again -
+measured as the near-totality of this fork's wall and ceiling hits, concentrated in exactly the flights that
+hit a lost-pitch moment at all. Not fixed yet.
+
+`nether_pathfinder.dll` (the native chunk pathfinder this fork inherits, not written here) has crashed the
+game once, reading an address of `-1` out of `getOrCreateChunk`, in the middle of a burst of path
+recalculations. Its chunk cache has a mutex, but three of the functions that touch it -
+`getChunkOrAir`, `getRealChunkOrDefault`, and the `erase_if` in `findPathFull` - never take it, while the
+chunk generator runs on its own three-thread pool; a generator thread inserting or erasing a chunk while one
+of those three reads it is a real data race, and a corrupted hash table reading `-1` back as a pointer is
+exactly the crash that produced. One occurrence in many hours of flight, so left alone for now - the fix,
+when it is worth doing, is taking that same lock in those three functions, in the native source, not
+switching to HackerRouter's fork of it, which locks the insert side only and brings an unrelated Overworld/End
+rewrite along with it.
 
 The takeoff ladder was reviewed twice after it was written, and what those reviews found has been fixed:
 the lift search skipping its own height near the world ceiling, the runway approved at one angle and
