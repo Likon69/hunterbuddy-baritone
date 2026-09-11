@@ -88,21 +88,12 @@ public final class ElytraBehavior implements Helper {
     // :sunglasses:
     public final NetherPathfinderContext context;
     /**
-     * A second native context holding the same chunks as {@link #context}, except that every chunk outside the
-     * corridor another mod pushed through {@link ElytraProcess#setPathCorridor} is inserted as solid, so a search
-     * in it cannot leave the corridor. Only the path search uses it; the raytraces, {@link #passable} and
-     * {@link NetherPathfinderContext#hasChunk} stay on {@link #context}, which knows the real terrain. Built
-     * with the behavior if a corridor is set at that moment and {@code null} otherwise, so a corridor pushed
-     * after that only takes effect from the next destination on.
+     * A second native context mirroring {@link #context}, except every chunk outside the corridor pushed via
+     * {@link ElytraProcess#setPathCorridor} is inserted as solid, so a search in it cannot leave the corridor.
+     * Only the path search uses it; raytraces and {@link #passable} stay on {@link #context}.
      */
     final NetherPathfinderContext corridorContext;
-    /**
-     * The chunks currently inserted as solid in {@link #corridorContext} for being outside the corridor, so the
-     * ring mask does not re-insert 32 KiB of solid for the same chunk every time it runs. Game thread only. Kept
-     * honest by every path that changes a chunk's state in that context: a chunk that flips into the corridor
-     * or gets admitted around a search start leaves the set, and a cull drops the far keys the native side has
-     * just forgotten.
-     */
+    /** Chunks currently masked solid in {@link #corridorContext} for being outside the corridor. Game thread only. */
     private final LongOpenHashSet maskedKeys = new LongOpenHashSet();
     /**
      * The player's chunk the last time the ring mask ran, so that it runs again as soon as the player has moved
@@ -125,6 +116,8 @@ public final class ElytraBehavior implements Helper {
     private static final int NO_PITCH_NOTE_TICKS = 5;
     /** How often, at most, the flight record notes a recalculation from our own feet that started elsewhere. */
     private static final int RECALC_NOTE_INTERVAL_TICKS = 40;
+    /** Yaw offsets {@link #solveSurvival} tries, smallest first, once the current heading can't clear the whole simulated horizon. */
+    private static final float[] YAW_RESCUE_OFFSETS = {30f, 60f, 90f};
     /**
      * Remaining cool-down ticks between firework usage
      */
@@ -150,6 +143,11 @@ public final class ElytraBehavior implements Helper {
     private boolean fireworkSeenSinceLit = true;
     /** Consecutive flight ticks the solver has had no pitch solution for; see {@link #tick()}. */
     private int noPitchTicks;
+    /**
+     * The yaw offset last logged as adopted by the survival rescue, or 0 while flying straight. Latched so the
+     * log gets one line per turning episode, not one per tick; cleared alongside {@link #noPitchTicks}.
+     */
+    private float lastLoggedYawOffset;
     /** Whether the flight record already says the hotbar is out of rockets; cleared by the next one lit. */
     private boolean noFireworksNoted;
 
@@ -199,13 +197,8 @@ public final class ElytraBehavior implements Helper {
         private int ticksNearUnchanged;
         private int playerNear;
 
-        // hb1: pathNextSegment resumes from the last node of the existing path, not from the
-        // player. When that node falls into a pocket the native x4 pathfinder can't leave, the
-        // segment computation fails every tick; the old behaviour was to keep retrying from the
-        // same unreachable node until the player's own flight carried them within 16 blocks of
-        // it, at which point the failure was reinterpreted as "arrived" and the bot landed there,
-        // however far short of the real destination. These three track that a segment failed so
-        // the next tick can restart the search from the player instead of the stuck node.
+        // Tracks a segment recompute that failed at the same resume node, so the next tick restarts
+        // the search from the player instead of retrying the same unreachable node.
         private BetterBlockPos failedSegmentStart;
         private long failedSegmentTick;
         private boolean restartFromPlayer;
@@ -276,12 +269,9 @@ public final class ElytraBehavior implements Helper {
 
             final UnaryOperator<UnpackedSegment> rejoin = segment -> {
                 if (!upToIncl.isPresent() || !segment.isFinished()) {
-                    // Either this was aimed onwards, at the destination or the end of a leg, and speaks for itself,
-                    // or the search ran out of time short of the rejoin node. Tacking the old tail onto a
-                    // segment that never reached it would leave a blind jump in the path, straight
-                    // through whatever lies between, that no obstacle check can ever fix: every
-                    // recomputation ends the same way, and the solver just circles the last node it
-                    // can reach. Leave the path unfinished instead and continue from where it got to.
+                    // Either aimed onwards and speaks for itself, or the search ran out of time short of the
+                    // rejoin node - tacking the old tail onto an unfinished segment would leave a blind jump
+                    // through whatever lies between. Leave it unfinished and continue from where it got to.
                     return segment;
                 }
                 return segment.append(after.stream(), complete);
@@ -331,26 +321,20 @@ public final class ElytraBehavior implements Helper {
                         if (ex != null) {
                             final Throwable cause = ex.getCause();
                             if (cause instanceof PathCalculationException) {
-                                // hb1: this handler is not on the main thread (it runs on
-                                // NetherPathfinderContext's own executor, same as path0/pathFindAsync) --
-                                // nothing here may touch ctx.playerFeet(), ctx.world(), or
-                                // pathRecalcSegment. repackNearPlayer already knows this and hops to the
-                                // main thread itself; everything added below just sets fields, read back
-                                // on the main thread next tick in attemptNextSegment, the same way
-                                // recalculating already is.
+                                // This callback runs off the main thread (NetherPathfinderContext's own
+                                // executor): nothing here may touch ctx.playerFeet(), ctx.world(), or
+                                // pathRecalcSegment. repackNearPlayer hops to the main thread itself; the
+                                // rest just sets fields, read back next tick in attemptNextSegment.
                                 repackNearPlayer("next segment computation failed");
                                 if (pathStart.distanceSq(ElytraBehavior.this.destination) <= 48 * 48) {
-                                    // Genuinely at the end: the same radius the landing-spot search
-                                    // downstream uses to decide "close enough". A resumed search failing
-                                    // this close to the destination really does mean there's nothing more
+                                    // Same radius the landing-spot search uses for "close enough": a resumed
+                                    // search failing this close to the destination means there's nothing left
                                     // to compute, not a stuck resume point.
                                     logDirect("Failed to compute next segment");
                                     logVerbose("Player is near the segment start, therefore repeating this calculation is pointless. Marking as complete");
                                     completePath = true;
                                 } else {
-                                    // One line per distinct failing node instead of one per tick: the old
-                                    // behaviour logged this every single retry, up to 100+ lines a second
-                                    // while the failure held.
+                                    // One line per distinct failing node, not per tick.
                                     if (!pathStart.equals(this.failedSegmentStart)) {
                                         logDirect("Failed to compute next segment");
                                     } else {
@@ -370,9 +354,8 @@ public final class ElytraBehavior implements Helper {
                                     this.failedSegmentStart = pathStart;
                                     this.failedSegmentTick = ctx.player().tickCount;
                                     this.restartFromPlayer = true;
-                                    // hasChunk/passable need the main thread (world access) -- this flag
-                                    // just says there's a fresh failedSegmentStart worth reporting on next
-                                    // tick; attemptNextSegment logs the rest and clears it.
+                                    // hasChunk/passable need the main thread; this just flags a fresh
+                                    // failure for attemptNextSegment to log next tick.
                                     this.segmentDiagnosticsPending = true;
                                 }
                             } else {
@@ -427,14 +410,10 @@ public final class ElytraBehavior implements Helper {
         private int lastRecalcNoteTick = -RECALC_NOTE_INTERVAL_TICKS;
 
         /**
-         * Writes down a search whose path came back starting somewhere other than where it was asked to start.
-         * The native search moves a start it has no room for to the nearest air it knows of, so this is the line
-         * that says the pathfinder's picture of the terrain and the client's disagree here - with what the client
-         * has in the block the search was asked to start from.
-         * <p>
-         * It reads the client world only, on purpose: it runs in a task on the game thread that can overlap the
-         * solver's own thread, and the pathfinder's cache reader is not safe to share. And it must never throw: it
-         * sits inside the future a takeoff waits on, where an exception would throw a good path away.
+         * Writes down a search whose path came back starting somewhere other than asked: the native search
+         * moved it to the nearest known air, so the pathfinder's picture of the terrain disagrees with the
+         * client's there. Reads the client world only, since it can overlap the solver's own thread, and must
+         * never throw - it sits inside a future a takeoff waits on.
          */
         private void noteStart(final String why, final BetterBlockPos from) {
             if (!FlightLog.enabled() || this.path.isEmpty()) {
@@ -475,10 +454,9 @@ public final class ElytraBehavior implements Helper {
         }
 
         /**
-         * {@link #path0} aimed onwards: at the destination, or at the end of the next leg of the way when the
-         * destination is farther off than a leg (see {@link #legTarget}). Reaching the end of a leg does not
-         * finish the path, so that segment is handed on unfinished, and the next segment carries on from its end
-         * the way it already does from a search that ran out before the destination.
+         * {@link #path0} aimed onwards: at the destination, or at the end of the next leg when the destination is
+         * farther off than a leg (see {@link #legTarget}). Reaching a leg's end does not finish the path, so that
+         * segment is handed on unfinished, same as a search that ran out before the destination.
          */
         private CompletableFuture<Void> pathOnwards(BlockPos src, UnaryOperator<UnpackedSegment> operator) {
             final BetterBlockPos leg = this.legTarget(src);
@@ -489,23 +467,14 @@ public final class ElytraBehavior implements Helper {
         }
 
         /**
-         * The end of the leg a search from {@code from} aims at: a point on the straight line to the destination, at
-         * least {@link Settings#elytraPathLegLength} blocks along it, the height following the same line. {@code null}
-         * when the search should aim at the destination itself: it is no more than a leg away, legs are off, or
-         * this path goes to a landing spot or follows a corridor, where there is no heading to hold.
+         * The end of the leg a search from {@code from} aims at: a point on the line to the destination, at least
+         * {@link Settings#elytraPathLegLength} blocks along it, pushed past the loaded chunks so the native search
+         * doesn't snap it to the nearest air short of there (a wall face, inside loaded terrain). {@code null} when
+         * the search should aim at the destination directly (no more than a leg away, legs off, landing/corridor).
          * <p>
-         * The native search only steps along the six axes, and its goal draws it by straight-line distance, so
-         * aimed at a destination far away it runs along whichever axis is nearer the heading and only turns once
-         * the destination lies at 45 degrees. Aimed a leg ahead it does the same within the leg, straying at most
-         * about a fifth of the leg off the line, and the next leg starts over from where this one ended.
-         * <p>
-         * The point is pushed out along the line past the chunks the client has loaded, and a chunk further, so that
-         * the air nearest to it is out there too. The native search moves a goal it has no room at to the nearest
-         * air, which inside loaded terrain is as likely as not the near face of the rock the line runs into: the leg
-         * would end against it, and the next one would start by backing out of it. From out there, the search goes
-         * through all of the loaded terrain on its way, round whatever is in it, the way it went towards the far
-         * destination; and the leg ends in chunks nobody flies through before they load, which is also when the
-         * next segment is asked for, as it always was.
+         * The native search only steps along six axes and is drawn by straight-line distance, so aimed far away it
+         * rides one axis and only turns once the destination sits at 45 degrees; a leg ahead bounds that drift to
+         * about a fifth of the leg instead.
          */
         private BetterBlockPos legTarget(final BlockPos from) {
             final int leg = Baritone.settings().elytraPathLegLength.value;
@@ -541,14 +510,10 @@ public final class ElytraBehavior implements Helper {
         }
 
         /**
-         * The search behind every path computation: inside the corridor first when one is set, on the full map
-         * otherwise or when the corridor has no way through. Called on the game thread (every caller is a tick or
-         * a takeoff state), which {@link #corridorAdmit} relies on; the continuations run on the native contexts'
-         * executors and touch nothing but the segments and the log.
-         * <p>
-         * A failure has to reach the callers' {@code whenComplete} handlers the way a plain {@code pathFindAsync}
-         * failure does, as a {@link CompletionException} whose cause is a {@link PathCalculationException}: that
-         * is what they test for, and anything else gets reported as an unhandled exception.
+         * The search behind every path computation: inside the corridor first when one is set, the full map
+         * otherwise or when the corridor has no way through. Called on the game thread, which {@link #corridorAdmit}
+         * relies on. A failure reaches callers' {@code whenComplete} the same way a plain {@code pathFindAsync}
+         * failure does: as a {@link CompletionException} wrapping a {@link PathCalculationException}.
          */
         private CompletableFuture<PathSegment> search(final BlockPos src, final BlockPos dst) {
             final boolean x4 = Baritone.settings().elytraPathNodeSize.value >= 4;
@@ -578,16 +543,10 @@ public final class ElytraBehavior implements Helper {
         }
 
         /**
-         * One search in one context: with wide nodes first if asked, and when that comes back a stub - or
-         * doesn't come back at all - and the adaptive setting is on, the same search again with fine nodes. A
-         * stub from the fine search is returned as it is; whether that means trying another context or flying
-         * it is the caller's business.
-         * <p>
-         * The failure case matters as much as the stub. A wide search whose start sits in a node with any rock
-         * in it has no start node and returns nothing at all, which is the ordinary state of affairs for a
-         * takeoff out of a crevice or off the top of a fungus - and it used to propagate straight out to a
-         * caller that ended the flight over it, without the fine search that would have found a way ever
-         * being tried.
+         * One search in one context: wide nodes first if asked, retried with fine nodes when that comes back a
+         * stub - or fails outright, e.g. a start node with any rock in it, the ordinary case off a crevice or a
+         * fungus - and adaptive is on. A stub from the fine search is returned as-is; the caller decides whether
+         * to try another context or fly it.
          */
         private CompletableFuture<PathSegment> searchIn(final NetherPathfinderContext where, final String label,
                                                        final BlockPos src, final BlockPos dst,
@@ -612,15 +571,9 @@ public final class ElytraBehavior implements Helper {
                                 logVerbose(String.format("path: %s x4 wanders (%.2fx the straight line), trying x2", label, wide));
                                 process.countDetourRetry(false);
                                 return fineSearch(where, label, src, dst).thenApply(fine -> {
-                                    // Only take the fine path if it really is the straighter one. The wide
-                                    // search is the fast one and flies better, so it keeps the segment unless
-                                    // the gap it routed around turns out to be worth threading.
-                                    //
-                                    // "Straighter" has to mean the same journey. A fine search that gave up
-                                    // early has a small ratio for having gone nowhere, and detourRatio's 0 for
-                                    // "too short to judge" is smaller than anything: both used to win against
-                                    // a wide path that actually reached the rejoin node (28 of 275 swaps in
-                                    // the 16:35 flight), which put a stub in place of a finished segment.
+                                    // Only take the fine path if it is genuinely straighter over the same
+                                    // journey: a fine search that gave up early scores near-zero for having
+                                    // gone nowhere, which must not beat a wide search that actually finished.
                                     final double narrow = detourRatio(src, fine);
                                     final boolean comparable = narrow > 0
                                             && !isStub(src, fine)
@@ -653,15 +606,10 @@ public final class ElytraBehavior implements Helper {
         }
 
         /**
-         * How far the segment travels for every block of progress it makes, as a multiple: {@code 1.0} is a
-         * straight line to where it ended up, {@code 2.0} means it flew twice as far as it got.
-         * <p>
-         * This is what tells a detour from a route. With 4-block nodes the search only goes through openings
-         * four blocks wide, so it routes around anything narrower - around a whole massif, sometimes, where a
-         * gliding player would have slipped through the crevice. That is a <i>successful, finished</i> search,
-         * so the stub test above never sees it and the fine search that would have found the gap never runs.
-         * {@code 0} for a segment too short to judge: near the start every path wanders a little, and paying
-         * for a second search over it would double the cost of the common case for nothing.
+         * How far the segment travels per block of progress, as a multiple of the straight line to where it
+         * ended up ({@code 1.0} straight, {@code 2.0} twice as far as it got). Tells a detour from a route: a
+         * 4-block search routes around anything narrower than that, a whole massif sometimes, as a successful
+         * finished search the stub test never catches. {@code 0} for a segment too short to judge.
          */
         private static double detourRatio(final BlockPos src, final PathSegment segment) {
             if (segment.packed.length < 4) {
@@ -698,11 +646,9 @@ public final class ElytraBehavior implements Helper {
 
         /**
          * An unfinished segment whose last node is still within 64 blocks (horizontally) of where it started.
-         * The native search does not return null for "no way through": when its open set runs dry or the timeout
-         * hits, it hands back the best node it reached, unfinished. Near the start that means it was boxed in,
-         * which is worth retrying with finer nodes or on the full map. Far from the start it is a segment worth
-         * flying: the destination normally sits hundreds of blocks past the loaded edge, so every search ends
-         * unfinished at the fake-chunk cutoff, and calling those failures would leave nothing to fly at all.
+         * The native search never returns null for "no way through" - it hands back its best node, unfinished -
+         * so near the start that means boxed in, worth retrying finer or on the full map; far from the start it
+         * is an ordinary cutoff at the edge of loaded terrain, worth flying.
          */
         private static boolean isStub(final BlockPos src, final PathSegment segment) {
             if (segment.finished) {
@@ -734,32 +680,25 @@ public final class ElytraBehavior implements Helper {
             }
 
             if (!ctx.player().isFallFlying()) {
-                // On the ground the path is not being flown, and every path we have there was computed on
-                // purpose by a takeoff state - from the exit cube above a hole, say, so that the takeoff
-                // rocket leaves along a line that is actually clear. The checks below only see that from
-                // inside the hole none of its nodes are visible, and recompute it from our feet every tick
-                // (the wide search failing each time for the rock in its start node): twenty native searches
-                // a second for as long as we walk, and the takeoff then leaves along the path from the feet,
-                // straight back into the wall the exit was chosen to avoid. Resume once we are flying.
+                // On the ground the path isn't being flown - it was computed on purpose by a takeoff state
+                // (the exit cube above a hole, so the takeoff rocket leaves along a clear line). Recomputing
+                // it from our feet here would replace it with one starting inside whatever we're standing in.
+                // Resume once flying.
                 return;
             }
 
             if (process.inTakeoffGrace()) {
-                // The path we are flying was computed by the takeoff, from a cube chosen so the first boost
-                // leaves along something clear. The checks below recompute from the player's feet, and for
-                // the first tick or two after the elytra opens the feet are still in the hole - so the path
-                // is replaced by one aimed out of it, which is what the takeoff picked the cube to avoid.
-                // Measured: five takeoffs out of five had their path replaced on the first airborne tick.
+                // The path was computed by the takeoff from a cube chosen so the first boost leaves along
+                // something clear. For the first tick or two after the elytra opens the feet are still in the
+                // hole, so recomputing here would replace it with one aimed out of the hole - exactly what the
+                // takeoff picked the cube to avoid.
                 return;
             }
 
             if (ctx.player().isInLava()) {
-                // Nothing here can be acted on while we are in a pool: solveAngles hands the whole tick to
-                // solveLavaEscape, which flies straight up and takes nothing from the path but a yaw. The
-                // checks below would still run, and from inside lava the view to every node is blocked by
-                // definition, so "no path points were visible" fires every tick and spends a full native
-                // search on a path that is not being followed - for as long as we are stuck, which is
-                // exactly when the game thread can least afford it. Resume when we are out.
+                // solveAngles hands lava entirely to solveLavaEscape, which only takes a yaw from the path.
+                // Every node's view is blocked by definition from inside lava, so the checks below would spend
+                // a full native search every tick for nothing. Resume once out.
                 return;
             }
 
@@ -848,10 +787,8 @@ public final class ElytraBehavior implements Helper {
             }
 
             if (this.segmentDiagnosticsPending && this.failedSegmentStart != null) {
-                // The only two facts §3.2 wants that the failure handler itself couldn't get at,
-                // off the main thread: whether the resume point's chunk had actually arrived, and
-                // whether the point itself sits in the solid or in a pocket of air. Logged once per
-                // failure, not every tick it's being backed off or retried.
+                // Off the main thread the failure handler couldn't check whether the resume point's chunk
+                // had arrived or whether the point itself is passable; logged once per failure here instead.
                 this.segmentDiagnosticsPending = false;
                 BetterBlockPos p = this.failedSegmentStart;
                 logVerbose(String.format(
@@ -862,11 +799,9 @@ public final class ElytraBehavior implements Helper {
             }
 
             if (this.restartFromPlayer && ctx.player().isFallFlying()) {
-                // Airborne: findAir<X4> from the player's own position finds an open cube almost
-                // immediately, since flying there at all means it isn't buried the way the stuck
-                // resume node was. Grounded (mid-landing, taking off) there's nothing better to
-                // search from yet, so fall through to the ordinary retry below instead until
-                // flight resumes.
+                // Airborne, an open cube near the player is found almost at once since flying there at all
+                // means it isn't buried like the stuck resume node. Grounded there's nothing better to search
+                // from yet, so fall through to the ordinary retry below until flight resumes.
                 this.restartFromPlayer = false;
                 logVerbose("Next segment start unreachable, re-pathing from the player");
                 this.pathRecalcSegment(OptionalInt.empty());
@@ -876,10 +811,8 @@ public final class ElytraBehavior implements Helper {
             final int last = this.path.size() - 1;
             if (this.path.get(last).equals(this.failedSegmentStart)
                     && ctx.player().tickCount - this.failedSegmentTick < 40) {
-                // The re-path from the player above (or a previous tick's own attempt) failed and
-                // landed right back on this same stuck node moments ago -- retrying it again this
-                // instant would just trade the old "Failed to compute next segment" spam for
-                // "Failed to recompute segment" spam instead. Give the world a few ticks.
+                // Landed right back on the same stuck node moments ago; give the world a few ticks
+                // instead of retrying instantly.
                 return;
             }
 
@@ -976,11 +909,9 @@ public final class ElytraBehavior implements Helper {
     private long lastRepackNearMs;
 
     /**
-     * Re-reads the chunks around the player into the pathfinder's cache. Everything the solver and the
-     * obstacle checks do runs against that cache, so if it disagrees with the world (a chunk whose packing was
-     * missed, a section the block update path never saw) the solver aims at terrain it thinks is air and
-     * nothing in here notices - the raytraces look at the same cache. This is the fix that cancelling and
-     * re-engaging used to apply by accident, through {@link #repackChunks()}.
+     * Re-reads the chunks around the player into the pathfinder's cache. The solver and obstacle checks run
+     * only against that cache, so if it disagrees with the world the solver aims at terrain it thinks is air
+     * and nothing here notices - the raytraces read the same cache.
      */
     private void repackNearPlayer(final String why) {
         if (!ctx.minecraft().isSameThread()) {
@@ -1023,9 +954,8 @@ public final class ElytraBehavior implements Helper {
     }
 
     /**
-     * Mirrors a chunk that was just packed into {@link #context} into {@link #corridorContext}: as real terrain
-     * if it is inside the corridor, as a solid block if it is not. Called from every place the main context is
-     * given a chunk, so the two contexts never disagree about which chunks exist, only about what is in them.
+     * Mirrors a chunk just packed into {@link #context} into {@link #corridorContext}: real terrain if inside
+     * the corridor, solid if not. Called everywhere the main context is given a chunk.
      */
     private void feedCorridor(final LevelChunk chunk) {
         if (this.corridorContext == null) {
@@ -1043,12 +973,9 @@ public final class ElytraBehavior implements Helper {
     }
 
     /**
-     * Applies a corridor change to {@link #corridorContext}. {@code flipped} holds the chunks whose membership
-     * changed: the ones now inside get their real terrain back, or air when the client does not have them (which
-     * is what a chunk the pathfinder was never given counts as anyway); the ones now outside are masked solid.
-     * Then the ring mask runs, see {@link #ringMask}. Game thread only: it reads loaded chunks and
-     * {@link #maskedKeys}. Public only because {@link ElytraProcess} is in another package, like the other
-     * members it reaches into here.
+     * Applies a corridor change to {@link #corridorContext}: chunks in {@code flipped} now inside get real
+     * terrain (or air if the client doesn't have them) back, the ones now outside are masked solid, then
+     * {@link #ringMask} runs. Game thread only.
      */
     public void corridorRefresh(final LongCollection flipped) {
         if (this.corridorContext == null || ctx.world() == null || ctx.player() == null) {
@@ -1083,10 +1010,9 @@ public final class ElytraBehavior implements Helper {
 
     /**
      * Masks solid, once, every chunk within {@link Settings#elytraCorridorMaskRadius} of the player that is not
-     * in the corridor, loaded or not. The pathfinder treats a chunk it was never given as air, so without this
-     * the search would leave the corridor through the unloaded fringe the moment the corridor bends. Runs on
-     * every push, and also whenever the player has moved to another chunk between pushes: the corridor is only
-     * pushed when it changes, and in the seconds it does not the player would otherwise fly out of the ring.
+     * in the corridor, loaded or not - the pathfinder treats a chunk it was never given as air, so without this
+     * the search would leave the corridor through the unloaded fringe. Runs on every push and whenever the
+     * player moves to another chunk between pushes.
      */
     private void ringMask() {
         final int radius = Baritone.settings().elytraCorridorMaskRadius.value;
@@ -1105,13 +1031,10 @@ public final class ElytraBehavior implements Helper {
     }
 
     /**
-     * Makes sure a corridor search can start from {@code src}: the loaded 3x3 chunks around it are packed as real
-     * terrain into the corridor context whether or not they are in the corridor. The pathfinder's search for an
-     * open cube to start in walks straight through solid, so from a start inside a masked chunk it would settle
-     * on some far cube on the other side of the wall and the path would begin nowhere near us. Transient by
-     * design: the next repack of these chunks masks them again if they are outside the corridor, which is why
-     * they leave {@link #maskedKeys} here instead of being recorded as masked while they are not. Queued on the
-     * corridor context's executor ahead of the search itself, so the search sees them.
+     * Makes sure a corridor search can start from {@code src}: packs the loaded 3x3 chunks around it as real
+     * terrain regardless of corridor membership, since the native search for an open start cube walks straight
+     * through solid and would otherwise settle on some far cube past the mask. Transient: the next repack masks
+     * them again if they are outside the corridor.
      */
     private void corridorAdmit(final BlockPos src) {
         if (this.corridorContext == null || !ctx.minecraft().isSameThread() || ctx.world() == null) {
@@ -1162,16 +1085,13 @@ public final class ElytraBehavior implements Helper {
             e.printStackTrace();
         }
         if (this.context.shutdown()) {
-            // Freeing on the game thread orders the free behind any path result already queued on it,
-            // and with both executors drained nothing else can be inside a native call.
+            // Freeing on the game thread orders it behind any path result already queued there, and with
+            // both executors drained nothing else can be inside a native call.
             ctx.minecraft().execute(this.context::free);
         }
-        // otherwise a search is still wedged in native code: freeing under it would be a use-after-free, so
-        // the context is abandoned. The leak is bounded to one context per wedged search.
+        // Otherwise a search is still wedged in native code: freeing under it would be a use-after-free, so
+        // the context is abandoned instead. The leak is bounded to one context per wedged search.
         if (this.corridorContext != null && this.corridorContext.shutdown()) {
-            // Same rules as the main context: freed on the game thread once its executor has drained, and
-            // abandoned if a search is wedged in it. Its bounded wait comes after the main context's, so a
-            // teardown with both wedged takes twice the timeout, on the Baritone executor.
             ctx.minecraft().execute(this.corridorContext::free);
         }
     }
@@ -1351,9 +1271,8 @@ public final class ElytraBehavior implements Helper {
         if (!solution.solvedPitch) {
             logVerbose("no pitch solution, probably gonna crash in a few ticks LOL!!!");
             if (++this.noPitchTicks == NO_PITCH_NOTE_TICKS) {
-                // Once per stretch, not per tick: a pinned glide sits in here for seconds. Nothing below this
-                // runs while it does, the solver's rockets included, which is the part worth knowing when
-                // reading back a flight that lost all its speed against a wall.
+                // Once per stretch, not per tick: a pinned glide sits in here for seconds, and the solver
+                // lights no rocket while it does.
                 final Vec3 pos = ctx.player().position();
                 final NetherPath path = this.pathManager.getPath();
                 final int near = Math.min(this.pathManager.getNear(), Math.max(0, path.size() - 1));
@@ -1369,6 +1288,7 @@ public final class ElytraBehavior implements Helper {
                 FlightLog.log("solver: a pitch reaches the path again, after " + this.noPitchTicks + " ticks without one");
             }
             this.noPitchTicks = 0;
+            this.lastLoggedYawOffset = 0;
             this.aimPos = new BetterBlockPos(solution.goingTo.x, solution.goingTo.y, solution.goingTo.z);
         }
 
@@ -1485,11 +1405,9 @@ public final class ElytraBehavior implements Helper {
     }
 
     /**
-     * In lava the elytra is inert: vanilla moves us by the fluid rules whenever we are in one, glide or not, so
-     * the only thrust is the rocket, at a fraction of its usual push, and the pool is walled in a few blocks
-     * away on every side. Aiming at the path would spend the rocket pushing against basalt. The way out is up:
-     * the steepest climb the simulation keeps clear, and a rocket, every time. Works without a path, since a
-     * lava takeoff may still be waiting for its first one.
+     * In lava the elytra is inert - vanilla applies only fluid movement, glide or not - so the only thrust is
+     * the rocket, at a fraction of its usual push, in a pool walled in a few blocks away on every side. The way
+     * out is up: the steepest climb the simulation keeps clear, with a rocket every time.
      */
     private Solution solveLavaEscape(final SolverContext context) {
         final NetherPath path = context.path;
@@ -1526,28 +1444,70 @@ public final class ElytraBehavior implements Helper {
         final int ticks = Math.max(5, Baritone.settings().elytraSimulationTicks.value);
         final int ticksBoosted = context.boost.isBoosted() ? Math.max(1, context.boost.getGuaranteedBoostTicks()) : 0;
 
-        final PitchResult best = this.solveSurvivalPitch(context, yaw, ticks, ticksBoosted, 0);
+        PitchResult best = this.solveSurvivalPitch(context, yaw, ticks, ticksBoosted, 0);
         if (best == null) { // cancelled by the game thread
             return unsolved;
         }
 
-        final int survivedTicks = best.steps.size() - 1;
-        // No pitch keeps us clear for the whole horizon, or we are in lava: if a rocket lit now would provably
-        // do better, light one. This used to wait until the impact was a dozen ticks out, which from the top of
-        // a climb out of a hole meant falling most of the way back in before doing anything about it.
+        float solvedYaw = yaw;
+        final int straightSurvived = best.steps.size() - 1;
+        int survivedTicks = straightSurvived;
+
+        // A hazard that spans the flight path front-on has no pitch that clears it, only a heading that goes
+        // around it. Try turning before spending a rocket or riding the impact in: stop at the first offset
+        // that survives the whole horizon, and only switch off the current best for a >=2-tick gain (or for
+        // reaching the full horizon outright, when the current best doesn't), so the yaw doesn't flap between
+        // two offsets from one tick to the next.
+        if (survivedTicks < ticks) {
+            search:
+            for (final float magnitude : YAW_RESCUE_OFFSETS) {
+                for (final float sign : new float[]{1f, -1f}) {
+                    final float candidateYaw = yaw + magnitude * sign;
+                    final PitchResult candidate = this.solveSurvivalPitch(context, candidateYaw, ticks, ticksBoosted, 0);
+                    if (candidate == null) {
+                        // cancelled by the game thread mid-search; keep whichever yaw already survived best
+                        // rather than throw away a real (if incomplete) answer for no answer at all
+                        break search;
+                    }
+                    final int candidateSurvived = candidate.steps.size() - 1;
+                    if (candidateSurvived >= survivedTicks + 2 || (candidateSurvived >= ticks && survivedTicks < ticks)) {
+                        best = candidate;
+                        solvedYaw = candidateYaw;
+                        survivedTicks = candidateSurvived;
+                        if (this.lastLoggedYawOffset != magnitude * sign) {
+                            this.lastLoggedYawOffset = magnitude * sign;
+                            FlightLog.log(String.format(Locale.ROOT,
+                                    "solver: turning %.0f degrees off the heading to stay clear (straight survives %d ticks, turned survives %d)",
+                                    magnitude * sign, straightSurvived, candidateSurvived));
+                        }
+                    }
+                    if (survivedTicks >= ticks) {
+                        break search;
+                    }
+                }
+            }
+        }
+        if (solvedYaw == yaw) {
+            // back to flying straight: clear the latch so a later turn, even to the same offset, logs again
+            // as the new episode it is instead of being mistaken for the one that just ended
+            this.lastLoggedYawOffset = 0;
+        }
+
+        // No pitch at the chosen yaw keeps us clear for the whole horizon, or we are in lava: light a rocket
+        // now if it would provably do better, rather than waiting until impact is imminent.
         final boolean impactAhead = survivedTicks < ticks;
         if ((impactAhead || context.ignoreLava) && !context.boost.isBoosted() && context.hasFireworks) {
-            final PitchResult boosted = this.solveSurvivalPitch(context, yaw, ticks, 10, 2);
+            final PitchResult boosted = this.solveSurvivalPitch(context, solvedYaw, ticks, 10, 2);
             if (boosted != null && (boosted.steps.size() > best.steps.size() + 2
                     || (context.ignoreLava && boosted.steps.size() >= best.steps.size()))) {
                 final Vec3 last = boosted.steps.get(boosted.steps.size() - 1);
                 this.simulationLine = boosted.steps;
-                return new Solution(context, new Rotation(yaw, boosted.pitch), context.start.add(last), true, true);
+                return new Solution(context, new Rotation(solvedYaw, boosted.pitch), context.start.add(last), true, true);
             }
         }
 
         this.simulationLine = best.steps;
-        return new Solution(context, new Rotation(yaw, best.pitch), null, false, false);
+        return new Solution(context, new Rotation(solvedYaw, best.pitch), null, false, false);
     }
 
     private PitchResult solveSurvivalPitch(final SolverContext context, final float yaw, final int ticks,
@@ -1558,10 +1518,9 @@ public final class ElytraBehavior implements Helper {
         final float currentPitch = ctx.playerRotations().getPitch();
 
         PitchResult best = null;
-        // scan the climbing side (negative pitch) first; new walls are usually escapable from above. With a
-        // rocket burning, don't settle for the first pitch that survives: take the one that ends highest. The
-        // boost is the one chance to get above whatever is boxing us in, and straight up is where that is most
-        // likely to be clear (the hole we just took off from, a crevice, the hollow beside a lava pond).
+        // Climbing side (negative pitch) first: new walls are usually escapable from above. With a rocket
+        // burning, take the pitch that ends highest rather than the first survivor - the boost is the one
+        // chance to get above whatever is boxing us in.
         final boolean preferHeight = ticksBoosted > 0;
         for (float pitch = currentPitch; pitch >= -90; pitch -= 3) {
             if (Thread.interrupted()) return null;
@@ -1640,9 +1599,8 @@ public final class ElytraBehavior implements Helper {
     }
 
     /**
-     * Whether the pathfinder's cache holds this block as solid: the picture the flight path and the solver work
-     * from, which is not always the client's. Game thread only, and only while the solver is not running - on
-     * the ground, say: the cache reader is shared with the solver and is not thread-safe.
+     * Whether the pathfinder's cache holds this block as solid - not always the same as the client's world.
+     * Game thread only, and only while the solver is not running: the cache reader is not thread-safe.
      */
     public boolean nativeSolid(int x, int y, int z) {
         // the cache cull frees chunks under this lock, and the reader caches a pointer to the last one it read
@@ -1666,11 +1624,9 @@ public final class ElytraBehavior implements Helper {
             }
             return false;
         }
-        // The use packet carries a look of its own, read off the player as it is built, and the server-side
-        // movement check compares it with the look in this tick's movement packet: the rotation LookBehavior
-        // is about to apply for the solver's target, not what the player is facing right now. Face that for
-        // the duration of the click so the two agree; the look behavior sets or restores the real rotation
-        // later in the tick regardless.
+        // The use packet carries a look read off the player as it's built, and the server's movement check
+        // compares it with this tick's movement packet - which will carry the solver's target look, not the
+        // player's current facing. Face that for the click so the two agree.
         final Rotation wire = this.baritone.getLookBehavior().getRotationForThisTick();
         final float yaw = ctx.player().getYRot();
         final float pitch = ctx.player().getXRot();
@@ -1694,9 +1650,8 @@ public final class ElytraBehavior implements Helper {
     }
 
     /**
-     * Puts a firework in the main hand. Picking one that is already in the hotbar is instant, but bringing one up
-     * from the rest of the inventory is a window click, and those only happen while stationary, so a takeoff has
-     * to call this before leaving the ground.
+     * Puts a firework in the main hand. Bringing one up from the inventory is a window click, which only
+     * happens while stationary, so a takeoff has to call this before leaving the ground.
      *
      * @return {@code true} if the main hand now holds a firework
      */
@@ -1748,12 +1703,10 @@ public final class ElytraBehavior implements Helper {
 
             Integer fireworkTicksExisted = ElytraBehavior.this.getAttachedFirework().map(e -> e.tickCount).orElse(null);
             if (fireworkTicksExisted == null && ElytraBehavior.this.remainingFireworkTicks > 0) {
-                // A rocket we lit within the cooldown whose entity the server hasn't shown us yet: a round trip,
-                // which on a busy server is several ticks. Solve as though it had been burning since we lit it.
-                // The boost follows whatever we aim at once it arrives, and planning an unboosted trajectory in
-                // the meantime - a shallow glide, since without thrust nothing else gets anywhere - is what
-                // points a takeoff rocket at the nearest wall. If it never shows up the assumption expires with
-                // the cooldown. The end-of-tick solve is for the next tick, whose cooldown is one lower.
+                // A rocket lit within the cooldown whose entity the server hasn't shown yet - a round trip,
+                // several ticks on a busy server. Solve as though it had been burning since it was lit: an
+                // unboosted trajectory in the meantime is a shallow glide that points a takeoff rocket at the
+                // nearest wall. Expires with the cooldown if the entity never shows up.
                 fireworkTicksExisted = FIREWORK_COOLDOWN_TICKS - ElytraBehavior.this.remainingFireworkTicks + (async ? 1 : 0);
             }
             this.boost = new FireworkBoost(fireworkTicksExisted, ElytraBehavior.this.minimumBoostTicks);
@@ -1803,9 +1756,8 @@ public final class ElytraBehavior implements Helper {
         public FireworkBoost(final Integer fireworkTicksExisted, final int minimumBoostTicks) {
             this.fireworkTicksExisted = fireworkTicksExisted;
 
-            // A client holding the rocket alive past its lifetime keeps pushing for this much longer, and
-            // both ends of the window move with it: those extra ticks are as guaranteed as the rest, being
-            // held deliberately rather than rolled for.
+            // A client holding the rocket alive past its lifetime keeps pushing this much longer; as
+            // guaranteed as the rest, since it's held deliberately rather than rolled for.
             final int extra = Math.max(0, Baritone.settings().elytraFireworkExtraBoostTicks.value);
             // this.lifetime = 10 * i + this.rand.nextInt(6) + this.rand.nextInt(7);
             this.minimumBoostTicks = minimumBoostTicks + extra;
@@ -2150,11 +2102,10 @@ public final class ElytraBehavior implements Helper {
             motion = step(motion, lookDirection, rotation.getPitch(), context.gravity, context.slowFalling);
             delta = delta.subtract(motion);
 
-            // Swept collision box: grow the hitbox ONLY in the direction of travel, plus a hair of
-            // padding. The old inflate(motion) grew symmetrically, so it also reached backwards and
-            // downwards into the block behind/under the player — which at takeoff is the ground, and
-            // made the solver see a collision that was not on the flight path and report "no pitch
-            // solution" (upstream #5047/#5052, issue #5094). expandTowards is the vanilla swept volume.
+            // Swept collision box: grows the hitbox only in the direction of travel, plus a hair of padding.
+            // The old inflate(motion) grew symmetrically, reaching into the block behind/under the player -
+            // at takeoff, the ground - and reporting a collision that wasn't on the flight path (upstream
+            // #5047/#5052, #5094).
             final AABB inMotion = hitbox.expandTowards(motion.x, motion.y, motion.z).inflate(0.01);
 
             int xmin = fastFloor(inMotion.minX);

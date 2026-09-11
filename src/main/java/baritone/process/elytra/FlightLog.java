@@ -23,14 +23,8 @@ import org.slf4j.LoggerFactory;
 
 /**
  * The elytra's flight record: one line per decision or event, into the game log and never into chat, every one
- * starting with {@code [flight]} so that a whole flight comes out of latest.log with one search.
- * <p>
- * It is for reading a failure back after the fact: which rung of the takeoff ladder was chosen and on what
- * numbers, where a flight path was asked to start and where it really starts, every rocket, every stretch the
- * solver had no pitch for, every fall, and how every flight ended. The chat log only ever hinted at those, and
- * some of it never reached chat at all - the takeoff rocket, for one, was lit without a word.
- * <p>
- * Safe from any thread: the logger is, and nothing here touches the world.
+ * starting with {@code [flight]} so a whole flight comes out of latest.log with one search - for reading a
+ * failure back after the fact. Safe from any thread: the logger is, and nothing here touches the world.
  */
 public final class FlightLog {
 
