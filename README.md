@@ -4,7 +4,7 @@ Fork of dekrom's Baritone (`v1.3.0-1.21.11`, Mojang mappings) with the elytra ch
 addon needs for long nether flights on 2b2t. Only the elytra code is touched.
 
 - Build: `./gradlew :fabric:build -Pmod_version=1.3.0-hbN-1.21.11`, output in
-  `dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb37** (change 23 not flown yet).
+  `dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb38** (change 24 not flown yet).
 - Logs: `#elytraChatSpam true` and `#chatDebug true`.
 - Patched native pathfinder: [Likon69/nether-pathfinder](https://github.com/Likon69/nether-pathfinder).
 
@@ -24,7 +24,7 @@ addon needs for long nether flights on 2b2t. Only the elytra code is touched.
 12. 25 obsidian are never spent by pillars or bridges, kept for the regear box (`obsidianReserve`).
 13. When no pitch clears the horizon, the rescue also tries turning 30, 60 or 90 degrees either way.
 14. A launch that falls straight back down counts against the same spot, so it is not repeated in a loop.
-15. The nether-pathfinder chunk cache is locked in every reader (native crash fixed), DLL built with the static MSVC runtime.
+15. The nether-pathfinder chunk cache takes its lock in every lookup (one native crash fixed), DLL built with the static MSVC runtime.
 16. An optional anchor (`elytraRouteAnchorX`, `elytraRouteAnchorZ`) pins the route line so sideways drift corrects itself.
 17. `LookBehavior.hunterbuddyNextRotation()` exposes the next tick's aim to the addon, kept through ProGuard.
 18. Every wall, ceiling and floor hit is logged with its side, speed and state.
@@ -33,6 +33,7 @@ addon needs for long nether flights on 2b2t. Only the elytra code is touched.
 21. Every heading jump over 60 degrees in one tick is logged with what decided it and the distance to the aimed point.
 22. The lava escape never pitches down, since the simulation sees lava as air.
 23. When the aimed point is under 4 blocks away, the last heading is held for up to 10 ticks, without rockets, if it stays clear for 5 ticks.
+24. A chunk can no longer be freed while a raytrace reads it: raytraces share a lock that the cache cull, chunk replacement and context free take exclusively (a second native crash).
 
 ## Settings added by this fork
 
