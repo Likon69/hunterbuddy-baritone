@@ -39,6 +39,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * @author Brady
@@ -79,6 +80,8 @@ public final class NetherPathfinderContext {
     // This lock must be held while there are active pointers to chunks in java,
     // but we just hold it for the entire tick so we don't have to think much about it.
     public final Object cullingLock = new Object();
+
+    private final ReentrantReadWriteLock chunkLock = new ReentrantReadWriteLock();
 
     // Visible for access in BlockStateOctreeInterface
     final long context;
@@ -122,7 +125,12 @@ public final class NetherPathfinderContext {
                 if (boi != null) {
                     boi.chunkPtr = 0L;
                 }
-                NetherPathfinder.cullFarChunks(this.context, chunkX, chunkZ, maxDistanceBlocks);
+                this.chunkLock.writeLock().lock();
+                try {
+                    NetherPathfinder.cullFarChunks(this.context, chunkX, chunkZ, maxDistanceBlocks);
+                } finally {
+                    this.chunkLock.writeLock().unlock();
+                }
             }
         });
     }
@@ -151,7 +159,12 @@ public final class NetherPathfinderContext {
             final LevelChunk chunk = ref.get();
             if (chunk != null) {
                 if (resetFirst) {
-                    NetherPathfinder.insertChunkData(this.context, chunkX, chunkZ, ALL_AIR);
+                    this.chunkLock.writeLock().lock();
+                    try {
+                        NetherPathfinder.insertChunkData(this.context, chunkX, chunkZ, ALL_AIR);
+                    } finally {
+                        this.chunkLock.writeLock().unlock();
+                    }
                 }
                 long ptr = NetherPathfinder.getOrCreateChunk(this.context, chunkX, chunkZ);
                 writeChunkData(chunk, ptr);
@@ -166,7 +179,14 @@ public final class NetherPathfinderContext {
      * so the two must never overlap.
      */
     public void queueSolid(final int chunkX, final int chunkZ) {
-        this.executeTask(() -> NetherPathfinder.insertChunkData(this.context, chunkX, chunkZ, ALL_SOLID));
+        this.executeTask(() -> {
+            this.chunkLock.writeLock().lock();
+            try {
+                NetherPathfinder.insertChunkData(this.context, chunkX, chunkZ, ALL_SOLID);
+            } finally {
+                this.chunkLock.writeLock().unlock();
+            }
+        });
     }
 
     /**
@@ -175,7 +195,14 @@ public final class NetherPathfinderContext {
      * where there is nothing real to pack in its place.
      */
     public void queueAir(final int chunkX, final int chunkZ) {
-        this.executeTask(() -> NetherPathfinder.insertChunkData(this.context, chunkX, chunkZ, ALL_AIR));
+        this.executeTask(() -> {
+            this.chunkLock.writeLock().lock();
+            try {
+                NetherPathfinder.insertChunkData(this.context, chunkX, chunkZ, ALL_AIR);
+            } finally {
+                this.chunkLock.writeLock().unlock();
+            }
+        });
     }
 
     public void queueBlockUpdate(BlockChangeEvent event) {
@@ -240,10 +267,15 @@ public final class NetherPathfinderContext {
      */
     public boolean raytrace(final double startX, final double startY, final double startZ,
                             final double endX, final double endY, final double endZ) {
-        if (this.destroyed) {
-            return false;
+        this.chunkLock.readLock().lock();
+        try {
+            if (this.destroyed) {
+                return false;
+            }
+            return NetherPathfinder.isVisible(this.context, NetherPathfinder.CACHE_MISS_SOLID, startX, startY, startZ, endX, endY, endZ);
+        } finally {
+            this.chunkLock.readLock().unlock();
         }
-        return NetherPathfinder.isVisible(this.context, NetherPathfinder.CACHE_MISS_SOLID, startX, startY, startZ, endX, endY, endZ);
     }
 
     /**
@@ -255,34 +287,49 @@ public final class NetherPathfinderContext {
      * @return {@code true} if there is visibility between the points
      */
     public boolean raytrace(final Vec3 start, final Vec3 end) {
-        if (this.destroyed) {
-            return false;
+        this.chunkLock.readLock().lock();
+        try {
+            if (this.destroyed) {
+                return false;
+            }
+            return NetherPathfinder.isVisible(this.context, NetherPathfinder.CACHE_MISS_SOLID, start.x, start.y, start.z, end.x, end.y, end.z);
+        } finally {
+            this.chunkLock.readLock().unlock();
         }
-        return NetherPathfinder.isVisible(this.context, NetherPathfinder.CACHE_MISS_SOLID, start.x, start.y, start.z, end.x, end.y, end.z);
     }
 
     public boolean raytrace(final int count, final double[] src, final double[] dst, final int visibility) {
-        if (this.destroyed) {
-            return false;
-        }
-        switch (visibility) {
-            case Visibility.ALL:
-                return NetherPathfinder.isVisibleMulti(this.context, NetherPathfinder.CACHE_MISS_SOLID, count, src, dst, false) == -1;
-            case Visibility.NONE:
-                return NetherPathfinder.isVisibleMulti(this.context, NetherPathfinder.CACHE_MISS_SOLID, count, src, dst, true) == -1;
-            case Visibility.ANY:
-                return NetherPathfinder.isVisibleMulti(this.context, NetherPathfinder.CACHE_MISS_SOLID, count, src, dst, true) != -1;
-            default:
-                throw new IllegalArgumentException("lol");
+        this.chunkLock.readLock().lock();
+        try {
+            if (this.destroyed) {
+                return false;
+            }
+            switch (visibility) {
+                case Visibility.ALL:
+                    return NetherPathfinder.isVisibleMulti(this.context, NetherPathfinder.CACHE_MISS_SOLID, count, src, dst, false) == -1;
+                case Visibility.NONE:
+                    return NetherPathfinder.isVisibleMulti(this.context, NetherPathfinder.CACHE_MISS_SOLID, count, src, dst, true) == -1;
+                case Visibility.ANY:
+                    return NetherPathfinder.isVisibleMulti(this.context, NetherPathfinder.CACHE_MISS_SOLID, count, src, dst, true) != -1;
+                default:
+                    throw new IllegalArgumentException("lol");
+            }
+        } finally {
+            this.chunkLock.readLock().unlock();
         }
     }
 
     public void raytrace(final int count, final double[] src, final double[] dst, final boolean[] hitsOut, final double[] hitPosOut) {
-        if (this.destroyed) {
-            java.util.Arrays.fill(hitsOut, true);
-            return;
+        this.chunkLock.readLock().lock();
+        try {
+            if (this.destroyed) {
+                java.util.Arrays.fill(hitsOut, true);
+                return;
+            }
+            NetherPathfinder.raytrace(this.context, NetherPathfinder.CACHE_MISS_SOLID, count, src, dst, hitsOut, hitPosOut);
+        } finally {
+            this.chunkLock.readLock().unlock();
         }
-        NetherPathfinder.raytrace(this.context, NetherPathfinder.CACHE_MISS_SOLID, count, src, dst, hitsOut, hitPosOut);
     }
 
     public void cancel() {
@@ -329,8 +376,13 @@ public final class NetherPathfinderContext {
      * before the shutdown is queued on the game thread ahead of this and still sees a live context.
      */
     public void free() {
-        this.destroyed = true;
-        NetherPathfinder.freeContext(this.context);
+        this.chunkLock.writeLock().lock();
+        try {
+            this.destroyed = true;
+            NetherPathfinder.freeContext(this.context);
+        } finally {
+            this.chunkLock.writeLock().unlock();
+        }
     }
 
     public long getSeed() {
