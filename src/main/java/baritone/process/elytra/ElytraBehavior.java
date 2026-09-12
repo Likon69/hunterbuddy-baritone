@@ -120,6 +120,8 @@ public final class ElytraBehavior implements Helper {
     private static final float[] YAW_RESCUE_OFFSETS = {30f, 60f, 90f};
     private static final int RESCUE_YAW_MIN_SURVIVAL_TICKS = 5;
     private static final int RESCUE_YAW_COMMIT_TICKS = 20;
+    private static final double NEAR_TARGET_HOLD_BLOCKS = 4.0;
+    private static final int NEAR_TARGET_HOLD_MAX_TICKS = 10;
     /**
      * Remaining cool-down ticks between firework usage
      */
@@ -147,6 +149,13 @@ public final class ElytraBehavior implements Helper {
     private int noPitchTicks;
     private float committedRescueYaw = Float.NaN;
     private int committedRescueTicks;
+    private float committedLavaYaw = Float.NaN;
+    private int committedLavaTicks;
+    private float lastTurnYaw = Float.NaN;
+    private int lastTurnTick;
+    private String lastTurnSource = "";
+    private int lastTurnNode = -1;
+    private int nearHoldTicks;
     /**
      * The yaw offset last logged as adopted by the survival rescue, or 0 while flying straight. Latched so the
      * log gets one line per turning episode, not one per tick; cleared alongside {@link #noPitchTicks}.
@@ -1294,9 +1303,31 @@ public final class ElytraBehavior implements Helper {
             return;
         }
 
-        baritone.getLookBehavior().updateTarget(solution.rotation, false);
+        final Solution effective = this.holdNearTurn(solution, inLava);
 
-        if (!solution.solvedPitch) {
+        final float turnYaw = effective.rotation.getYaw();
+        if (!Float.isNaN(this.lastTurnYaw) && ctx.player().tickCount == this.lastTurnTick + 1) {
+            final float d = Mth.wrapDegrees(turnYaw - this.lastTurnYaw);
+            if (Math.abs(d) > 60) {
+                final Vec3 pos = ctx.player().position();
+                final double dist = effective.goingTo == null ? -1 :
+                        Math.sqrt(effective.context.start.distanceToSqr(effective.goingTo.x, effective.context.start.y, effective.goingTo.z));
+                FlightLog.log(String.format(Locale.ROOT,
+                        "turn: %.0f degrees in one tick, %s -> %s, node %d -> %d of %d, dist %.1f, yaw %.0f -> %.0f pitch %.0f, speed %.2f, boost %s, noPitch %d, lava %s, at %.1f %.1f %.1f",
+                        d, this.lastTurnSource, effective.source, this.lastTurnNode, effective.node, this.pathManager.getPath().size(), dist,
+                        this.lastTurnYaw, turnYaw, effective.rotation.getPitch(), ctx.player().getDeltaMovement().horizontalDistance(),
+                        effective.context.boost.isBoosted() ? "yes" : "no", this.noPitchTicks, inLava ? "yes" : "no",
+                        pos.x, pos.y, pos.z));
+            }
+        }
+        this.lastTurnYaw = turnYaw;
+        this.lastTurnTick = ctx.player().tickCount;
+        this.lastTurnSource = effective.source;
+        this.lastTurnNode = effective.node;
+
+        baritone.getLookBehavior().updateTarget(effective.rotation, false);
+
+        if (!effective.solvedPitch) {
             logVerbose("no pitch solution, probably gonna crash in a few ticks LOL!!!");
             if (++this.noPitchTicks == NO_PITCH_NOTE_TICKS) {
                 // Once per stretch, not per tick: a pinned glide sits in here for seconds, and the solver
@@ -1308,7 +1339,7 @@ public final class ElytraBehavior implements Helper {
                         "solver: for %d ticks no pitch has reached the path, now at %.1f %.1f %.1f (speed %.2f, nearest node %d of %d%s), flying yaw %.0f pitch %.0f to stay clear, and the solver lights no rocket until a pitch is found",
                         NO_PITCH_NOTE_TICKS, pos.x, pos.y, pos.z, ctx.player().getDeltaMovement().length(), near, path.size(),
                         path.isEmpty() ? "" : String.format(Locale.ROOT, ", %.1f blocks away", Math.sqrt(ctx.player().distanceToSqr(path.getVec(near)))),
-                        solution.rotation.getYaw(), solution.rotation.getPitch()));
+                        effective.rotation.getYaw(), effective.rotation.getPitch()));
             }
             return;
         } else {
@@ -1319,16 +1350,59 @@ public final class ElytraBehavior implements Helper {
             this.lastLoggedYawOffset = 0;
             this.committedRescueYaw = Float.NaN;
             this.committedRescueTicks = 0;
-            this.aimPos = new BetterBlockPos(solution.goingTo.x, solution.goingTo.y, solution.goingTo.z);
+            this.aimPos = new BetterBlockPos(effective.goingTo.x, effective.goingTo.y, effective.goingTo.z);
+        }
+
+        if ("path hold".equals(effective.source)) {
+            return;
         }
 
         this.tickUseFireworks(
-                solution.context.start,
-                solution.goingTo,
-                solution.context.boost.isBoosted(),
-                solution.forceUseFirework || inLava,
+                effective.context.start,
+                effective.goingTo,
+                effective.context.boost.isBoosted(),
+                effective.forceUseFirework || inLava,
                 inLava
         );
+    }
+
+    private Solution holdNearTurn(final Solution s, final boolean inLava) {
+        final boolean eligible = s.solvedPitch && s.goingTo != null && s.source.startsWith("path")
+                && !this.landingMode && !inLava
+                && !Float.isNaN(this.lastTurnYaw) && ctx.player().tickCount == this.lastTurnTick + 1;
+
+        if (eligible) {
+            final double dx = s.context.start.x - s.goingTo.x;
+            final double dz = s.context.start.z - s.goingTo.z;
+            final double dist = Math.sqrt(dx * dx + dz * dz);
+            final float turnDelta = Math.abs(Mth.wrapDegrees(s.rotation.getYaw() - this.lastTurnYaw));
+            if (dist < NEAR_TARGET_HOLD_BLOCKS && turnDelta > 60 && this.nearHoldTicks < NEAR_TARGET_HOLD_MAX_TICKS) {
+                final int ticks = Math.max(5, Baritone.settings().elytraSimulationTicks.value);
+                final int ticksBoosted = s.context.boost.isBoosted() ? Math.max(1, s.context.boost.getGuaranteedBoostTicks()) : 0;
+                final int ticksBoostDelay = 0;
+                final PitchResult held = this.solveSurvivalPitch(s.context, this.lastTurnYaw, ticks, ticksBoosted, ticksBoostDelay);
+                if (held != null && held.steps.size() - 1 >= RESCUE_YAW_MIN_SURVIVAL_TICKS) {
+                    final int startedAt = this.nearHoldTicks;
+                    this.nearHoldTicks++;
+                    this.simulationLine = held.steps;
+                    if (startedAt == 0) {
+                        final Vec3 pos = ctx.player().position();
+                        FlightLog.log(String.format(Locale.ROOT,
+                                "hold: kept yaw %.0f instead of %.0f (%.0f degrees) toward a point %.1f blocks away, survives %d ticks, speed %.2f, at %.1f %.1f %.1f",
+                                this.lastTurnYaw, s.rotation.getYaw(), turnDelta, dist, held.steps.size() - 1,
+                                ctx.player().getDeltaMovement().horizontalDistance(), pos.x, pos.y, pos.z));
+                    }
+                    final Vec3 last = held.steps.get(held.steps.size() - 1);
+                    return new Solution(s.context, new Rotation(this.lastTurnYaw, held.pitch), s.context.start.add(last), true, false, "path hold", s.node);
+                }
+            }
+        }
+
+        if (this.nearHoldTicks > 0) {
+            FlightLog.log(String.format(Locale.ROOT, "hold: released after %d ticks", this.nearHoldTicks));
+        }
+        this.nearHoldTicks = 0;
+        return s;
     }
 
     public void onPostTick(TickEvent event) {
@@ -1347,6 +1421,8 @@ public final class ElytraBehavior implements Helper {
         if (context.ignoreLava) {
             return this.solveLavaEscape(context);
         }
+        this.committedLavaYaw = Float.NaN;
+        this.committedLavaTicks = 0;
         final NetherPath path = context.path;
         final int playerNear = landingMode ? path.size() - 1 : context.playerNear;
         final Vec3 start = context.start;
@@ -1421,12 +1497,13 @@ public final class ElytraBehavior implements Helper {
 
                         final Pair<Float, Boolean> pitch = this.solvePitch(context, dest, relaxation);
                         if (pitch == null) {
-                            solution = new Solution(context, new Rotation(yaw, ctx.playerRotations().getPitch()), null, false, false);
+                            solution = new Solution(context, new Rotation(yaw, ctx.playerRotations().getPitch()), null, false, false, "path-unsolved", i);
                             continue;
                         }
 
                         // A solution was found with yaw AND pitch, so just immediately return it.
-                        return new Solution(context, new Rotation(yaw, pitch.first()), dest, true, pitch.second());
+                        final String pathSource = relaxation == 0 ? "path" : "path relaxed " + relaxation;
+                        return new Solution(context, new Rotation(yaw, pitch.first()), dest, true, pitch.second(), pathSource, i);
                     }
                 }
             }
@@ -1446,18 +1523,45 @@ public final class ElytraBehavior implements Helper {
         final Vec3 towards = path.isEmpty()
                 ? Vec3.atCenterOf(this.destination)
                 : path.getVec(Math.min(context.playerNear + 1, path.size() - 1));
-        final float yaw = RotationUtils.calcRotationFromVec3d(context.start, towards, ctx.playerRotations()).getYaw();
+        final float freeYaw = RotationUtils.calcRotationFromVec3d(context.start, towards, ctx.playerRotations()).getYaw();
         final int ticks = Math.max(5, Baritone.settings().elytraSimulationTicks.value);
         // simulate with a rocket burning whether or not one is yet: the escape needs one, and tick() lights it
         final int ticksBoosted = context.boost.isBoosted() ? Math.max(1, context.boost.getGuaranteedBoostTicks()) : 10;
         final int ticksBoostDelay = context.boost.isBoosted() ? 0 : 2;
-        final PitchResult best = this.solveSurvivalPitch(context, yaw, ticks, ticksBoosted, ticksBoostDelay);
+
+        final boolean committed = !Float.isNaN(this.committedLavaYaw);
+        if (committed) {
+            this.committedLavaTicks++;
+        } else {
+            this.committedLavaTicks = 0;
+        }
+        float yaw = committed ? this.committedLavaYaw : freeYaw;
+
+        PitchResult best = this.solveSurvivalPitch(context, yaw, ticks, ticksBoosted, ticksBoostDelay, true);
         if (best == null) {
             return null; // cancelled by the game thread
         }
+
+        final int survivedTicks = best.steps.size() - 1;
+        final boolean rebase = !committed
+                || survivedTicks < RESCUE_YAW_MIN_SURVIVAL_TICKS
+                || this.committedLavaTicks >= RESCUE_YAW_COMMIT_TICKS;
+
+        if (rebase && yaw != freeYaw) {
+            final PitchResult rebased = this.solveSurvivalPitch(context, freeYaw, ticks, ticksBoosted, ticksBoostDelay, true);
+            if (rebased != null) {
+                best = rebased;
+            }
+            yaw = freeYaw;
+        }
+        if (rebase) {
+            this.committedLavaTicks = 0;
+        }
+        this.committedLavaYaw = yaw;
+
         this.simulationLine = best.steps;
         final Vec3 last = best.steps.get(best.steps.size() - 1);
-        return new Solution(context, new Rotation(yaw, best.pitch), context.start.add(last), true, true);
+        return new Solution(context, new Rotation(yaw, best.pitch), context.start.add(last), true, true, "lava", -1);
     }
 
     /**
@@ -1549,6 +1653,9 @@ public final class ElytraBehavior implements Helper {
         }
         this.committedRescueYaw = solvedYaw;
 
+        final float rescueOffset = Mth.wrapDegrees(solvedYaw - yaw);
+        final String rescueSource = rescueOffset == 0 ? "rescue" : String.format(Locale.ROOT, "rescue %+.0f", rescueOffset);
+
         // No pitch at the chosen yaw keeps us clear for the whole horizon, or we are in lava: light a rocket
         // now if it would provably do better, rather than waiting until impact is imminent.
         final boolean impactAhead = survivedTicks < ticks;
@@ -1558,16 +1665,21 @@ public final class ElytraBehavior implements Helper {
                     || (context.ignoreLava && boosted.steps.size() >= best.steps.size()))) {
                 final Vec3 last = boosted.steps.get(boosted.steps.size() - 1);
                 this.simulationLine = boosted.steps;
-                return new Solution(context, new Rotation(solvedYaw, boosted.pitch), context.start.add(last), true, true);
+                return new Solution(context, new Rotation(solvedYaw, boosted.pitch), context.start.add(last), true, true, "rescue rocket" + (rescueOffset == 0 ? "" : String.format(Locale.ROOT, " %+.0f", rescueOffset)), -1);
             }
         }
 
         this.simulationLine = best.steps;
-        return new Solution(context, new Rotation(solvedYaw, best.pitch), null, false, false);
+        return new Solution(context, new Rotation(solvedYaw, best.pitch), null, false, false, rescueSource, -1);
     }
 
     private PitchResult solveSurvivalPitch(final SolverContext context, final float yaw, final int ticks,
                                            final int ticksBoosted, final int ticksBoostDelay) {
+        return this.solveSurvivalPitch(context, yaw, ticks, ticksBoosted, ticksBoostDelay, false);
+    }
+
+    private PitchResult solveSurvivalPitch(final SolverContext context, final float yaw, final int ticks,
+                                           final int ticksBoosted, final int ticksBoostDelay, final boolean climbOnly) {
         final float yawRadians = yaw * RotationUtils.DEG_TO_RAD_F;
         // a goal far along the direction we are about to face, so that the simulated yaw stays fixed
         final Vec3 direction = new Vec3(-Mth.sin(yawRadians) * 1e4, 0, Mth.cos(yawRadians) * 1e4);
@@ -1578,11 +1690,13 @@ public final class ElytraBehavior implements Helper {
         // burning, take the pitch that ends highest rather than the first survivor - the boost is the one
         // chance to get above whatever is boxing us in.
         final boolean preferHeight = ticksBoosted > 0;
-        for (float pitch = currentPitch; pitch >= -90; pitch -= 3) {
+        final float startPitch = climbOnly ? Math.min(currentPitch, 0) : currentPitch;
+        for (float pitch = startPitch; pitch >= -90; pitch -= 3) {
             if (Thread.interrupted()) return null;
             best = this.betterSurvival(context, direction, pitch, ticks, ticksBoosted, ticksBoostDelay, best);
             if (!preferHeight && best != null && best.steps.size() - 1 >= ticks) return best;
         }
+        if (climbOnly) return best;
         if (best != null && best.steps.size() - 1 >= ticks) return best;
         for (float pitch = currentPitch + 3; pitch <= 90; pitch += 3) {
             if (Thread.interrupted()) return null;
@@ -1878,13 +1992,17 @@ public final class ElytraBehavior implements Helper {
         public final Vec3 goingTo;
         public final boolean solvedPitch;
         public final boolean forceUseFirework;
+        public final String source;
+        public final int node;
 
-        public Solution(SolverContext context, Rotation rotation, Vec3 goingTo, boolean solvedPitch, boolean forceUseFirework) {
+        public Solution(SolverContext context, Rotation rotation, Vec3 goingTo, boolean solvedPitch, boolean forceUseFirework, String source, int node) {
             this.context = context;
             this.rotation = rotation;
             this.goingTo = goingTo;
             this.solvedPitch = solvedPitch;
             this.forceUseFirework = forceUseFirework;
+            this.source = source;
+            this.node = node;
         }
     }
 
