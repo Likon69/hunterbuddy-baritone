@@ -64,6 +64,8 @@
 # conservatively keep all of it, even though only PathSegment.<init> is needed
 -keep,allowoptimization class dev.babbaj.pathfinder.** { *; }
 
+-keep class baritone.behavior.LookBehavior { public float[] hunterbuddyNextRotation(); }
+
 # Keep - Applications. Keep all application classes, along with their 'main'
 # methods.
 -keepclasseswithmembers public class * {

@@ -171,6 +171,14 @@ public final class LookBehavior extends Behavior implements ILookBehavior {
         return this.processor.peekRotation(this.target.rotation);
     }
 
+    public float[] hunterbuddyNextRotation() {
+        if (this.target == null || this.target.mode == Target.Mode.NONE) {
+            return null;
+        }
+        final Rotation next = this.processor.peekRotation(this.target.rotation);
+        return new float[]{next.getYaw(), next.getPitch()};
+    }
+
     public Optional<Rotation> getEffectiveRotation() {
         if (Baritone.settings().freeLook.value) {
             return Optional.ofNullable(this.serverRotation);
