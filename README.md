@@ -5,7 +5,7 @@ HunterBuddy Meteor addon needs for long-distance elytra flight in the nether on 
 below is in the elytra code; nothing else in Baritone is touched.
 
 Built with `./gradlew :fabric:build -Pmod_version=1.3.0-hbN-1.21.11`, output in
-`dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb29**.
+`dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb31**.
 
 To see anything the elytra code logs, both of `#elytraChatSpam true` and `#chatDebug true` are
 needed - the verbose lines go through `logDebug`, which the second setting gates.
@@ -290,6 +290,34 @@ repeatably, no deadlock or crash, a path found each time.
 Built into hb29. Not yet flown in the mod itself - this closes the two crashes diagnosed from hs_err logs and
 source, and the lock has now run standalone, but nothing here has run inside a live Baritone session yet.
 
+## 16. Anchor the route line so a lateral drift corrects itself
+
+§10's legs keep every search from riding one axis for the whole journey, but they aim along the line from the
+current position to the destination, and that line is not fixed - it swings every time the heading drifts off
+by even a fraction of a degree over a leg or two. On a long enough flight, a swept-heading path ends up some
+distance to the side of where it started out heading, and at that point a further destination that is still far
+off barely changes the aim: the remaining lateral offset, however large, is a vanishingly small angle against
+the remaining distance, so nothing left in the search ever steers back onto the original line. The drift itself,
+whatever holds the heading a fraction of a degree off course over any one leg, is not something this section
+touches; it is the aim that never resorbs it that changes here.
+
+`elytraRouteAnchorX` and `elytraRouteAnchorZ` (both `Long.MIN_VALUE`, meaning off, by default) fix a point that,
+together with the destination, defines a route line that does not move with the player. With both set, the leg
+target is no longer read off the line from the current position to the destination, but off the orthogonal
+projection of the current position onto the anchor-to-destination line instead - clamped to stay between the
+anchor and the destination, so standing behind the anchor or past the destination on that axis does not throw
+the projection outside the flight. The leg is then measured the same distance ahead as before (`elytraPathLegLength`,
+or further out past the loaded chunks, unchanged), just walked along the anchor line rather than along the line
+to the player. A lateral offset now bends the aim back towards the line instead of leaving it alone, and by an
+amount that grows with the offset: the further off the line the flight has drifted, the harder the next leg
+aims back towards it, converging rather than snapping back in one turn. With either setting left at its default,
+every leg target is computed exactly as it was before this section - the anchor changes nothing until both are
+set. The destination-only case (already inside a leg's length, legs turned off, corridor search active) is
+unaffected either way. The end-of-flight log line records the anchor being in effect (`... on the anchored line`)
+alongside the existing leg-length figure.
+
+Built into hb31. Not yet flown in the mod itself.
+
 ## Settings added by this fork
 
 | Setting | Default | What it does |
@@ -306,6 +334,8 @@ source, and the lock has now run standalone, but nothing here has run inside a l
 | `elytraFireworkBoostMultiplier` | `1.5` | Firework acceleration the flight simulation assumes |
 | `elytraFireworkExtraBoostTicks` | `0` | Ticks a boost lasts beyond the rocket's own lifetime |
 | `elytraPathLegLength` | `128` | How far ahead a search aims on a long, straight destination, in blocks |
+| `elytraRouteAnchorX` | `Long.MIN_VALUE` | X of a fixed point that, with the destination, pins the leg-aim line (off until Z is also set) |
+| `elytraRouteAnchorZ` | `Long.MIN_VALUE` | Z of that fixed point (off until X is also set) |
 | `elytraLavaWalkOutSeconds` | `10` | Seconds in lava before the takeoff gives up on the elytra and walks out |
 | `obsidianReserve` | `25` | Obsidian never spent by a pillar, a bridge or anything else Baritone places |
 

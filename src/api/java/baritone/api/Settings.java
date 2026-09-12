@@ -1620,6 +1620,10 @@ public final class Settings {
      */
     public final Setting<Integer> elytraPathLegLength = new Setting<>(128);
 
+    public final Setting<Long> elytraRouteAnchorX = new Setting<>(Long.MIN_VALUE);
+
+    public final Setting<Long> elytraRouteAnchorZ = new Setting<>(Long.MIN_VALUE);
+
     /**
      * How many seconds in lava before the elytra stops being opened to get out of it and the bot walks out instead,
      * to the nearest place to stand within a few blocks. The elytra gets out of lava deep enough to glide in within

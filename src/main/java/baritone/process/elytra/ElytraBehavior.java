@@ -118,6 +118,8 @@ public final class ElytraBehavior implements Helper {
     private static final int RECALC_NOTE_INTERVAL_TICKS = 40;
     /** Yaw offsets {@link #solveSurvival} tries, smallest first, once the current heading can't clear the whole simulated horizon. */
     private static final float[] YAW_RESCUE_OFFSETS = {30f, 60f, 90f};
+    private static final int RESCUE_YAW_MIN_SURVIVAL_TICKS = 5;
+    private static final int RESCUE_YAW_COMMIT_TICKS = 20;
     /**
      * Remaining cool-down ticks between firework usage
      */
@@ -143,6 +145,8 @@ public final class ElytraBehavior implements Helper {
     private boolean fireworkSeenSinceLit = true;
     /** Consecutive flight ticks the solver has had no pitch solution for; see {@link #tick()}. */
     private int noPitchTicks;
+    private float committedRescueYaw = Float.NaN;
+    private int committedRescueTicks;
     /**
      * The yaw offset last logged as adopted by the survival rescue, or 0 while flying straight. Latched so the
      * log gets one line per turning episode, not one per tick; cleared alongside {@link #noPitchTicks}.
@@ -150,6 +154,7 @@ public final class ElytraBehavior implements Helper {
     private float lastLoggedYawOffset;
     /** Whether the flight record already says the hotbar is out of rockets; cleared by the next one lit. */
     private boolean noFireworksNoted;
+    private String lastCollisionLine;
 
     private BlockStateInterface bsi;
     private final BlockStateOctreeInterface boi;
@@ -484,20 +489,41 @@ public final class ElytraBehavior implements Helper {
                 return null;
             }
             final BetterBlockPos dest = ElytraBehavior.this.destination;
-            final double dx = dest.x - from.getX();
-            final double dz = dest.z - from.getZ();
+            final BlockPos aimFrom = routeAnchoredFrom(from, dest);
+            final double dx = dest.x - aimFrom.getX();
+            final double dz = dest.z - aimFrom.getZ();
             final double distance = Math.sqrt(dx * dx + dz * dz);
             // in chunk-sized steps, out to well past the farthest a client loads; all of that loaded, and it is as if
             // the destination were no further
             for (double along = leg; along + 16 < distance && along <= leg + 1024; along += 16) {
                 // both the sample and the point handed back out of the loaded chunks: the loaded area is made of
                 // whole chunks and fills in unevenly at its edge, so one sample out of it does not put the next out
-                final BetterBlockPos end = pointAlong(from, dest, (along + 16) / distance);
-                if (!ctx.world().isLoaded(pointAlong(from, dest, along / distance)) && !ctx.world().isLoaded(end)) {
+                final BetterBlockPos end = pointAlong(aimFrom, dest, (along + 16) / distance);
+                if (!ctx.world().isLoaded(pointAlong(aimFrom, dest, along / distance)) && !ctx.world().isLoaded(end)) {
                     return end;
                 }
             }
             return null;
+        }
+
+        private static BlockPos routeAnchoredFrom(final BlockPos from, final BetterBlockPos dest) {
+            final long anchorX = Baritone.settings().elytraRouteAnchorX.value;
+            final long anchorZ = Baritone.settings().elytraRouteAnchorZ.value;
+            if (anchorX == Long.MIN_VALUE || anchorZ == Long.MIN_VALUE) {
+                return from;
+            }
+            final double lineX = dest.x - anchorX;
+            final double lineZ = dest.z - anchorZ;
+            final double lengthSq = lineX * lineX + lineZ * lineZ;
+            if (lengthSq == 0) {
+                return from;
+            }
+            final double t = Mth.clamp(((from.getX() - anchorX) * lineX + (from.getZ() - anchorZ) * lineZ) / lengthSq, 0.0, 1.0);
+            return new BlockPos(
+                    (int) Math.round(anchorX + t * lineX),
+                    from.getY(),
+                    (int) Math.round(anchorZ + t * lineZ)
+            );
         }
 
         /** The point {@code fraction} of the way from {@code from} to {@code dest}, at a height the native search accepts. */
@@ -1235,11 +1261,13 @@ public final class ElytraBehavior implements Helper {
 
         if (ctx.player().horizontalCollision) {
             logVerbose("hbonk");
+            logCollision(false);
             // the simulation never flies into anything it knows about, so this is something it didn't
             repackNearPlayer("hit something the cache didn't know about");
         }
         if (ctx.player().verticalCollision) {
             logVerbose("vbonk");
+            logCollision(true);
         }
         if (this.bsi == null) {
             // onTick0 has not run yet (a path calculation has held the lock every tick so far), nothing to solve against
@@ -1289,6 +1317,8 @@ public final class ElytraBehavior implements Helper {
             }
             this.noPitchTicks = 0;
             this.lastLoggedYawOffset = 0;
+            this.committedRescueYaw = Float.NaN;
+            this.committedRescueTicks = 0;
             this.aimPos = new BetterBlockPos(solution.goingTo.x, solution.goingTo.y, solution.goingTo.z);
         }
 
@@ -1440,9 +1470,17 @@ public final class ElytraBehavior implements Helper {
         if (landingMode) {
             return unsolved;
         }
-        final float yaw = unsolved != null ? unsolved.rotation.getYaw() : ctx.playerRotations().getYaw();
+        final float freeYaw = unsolved != null ? unsolved.rotation.getYaw() : ctx.playerRotations().getYaw();
         final int ticks = Math.max(5, Baritone.settings().elytraSimulationTicks.value);
         final int ticksBoosted = context.boost.isBoosted() ? Math.max(1, context.boost.getGuaranteedBoostTicks()) : 0;
+
+        final boolean committed = !Float.isNaN(this.committedRescueYaw);
+        if (committed) {
+            this.committedRescueTicks++;
+        } else {
+            this.committedRescueTicks = 0;
+        }
+        float yaw = committed ? this.committedRescueYaw : freeYaw;
 
         PitchResult best = this.solveSurvivalPitch(context, yaw, ticks, ticksBoosted, 0);
         if (best == null) { // cancelled by the game thread
@@ -1450,15 +1488,32 @@ public final class ElytraBehavior implements Helper {
         }
 
         float solvedYaw = yaw;
-        final int straightSurvived = best.steps.size() - 1;
-        int survivedTicks = straightSurvived;
+        int survivedTicks = best.steps.size() - 1;
+
+        final boolean rebase = !committed
+                || survivedTicks < RESCUE_YAW_MIN_SURVIVAL_TICKS
+                || this.committedRescueTicks >= RESCUE_YAW_COMMIT_TICKS;
+
+        if (rebase && yaw != freeYaw) {
+            final PitchResult rebased = this.solveSurvivalPitch(context, freeYaw, ticks, ticksBoosted, 0);
+            if (rebased != null) {
+                best = rebased;
+                survivedTicks = rebased.steps.size() - 1;
+            }
+            yaw = freeYaw;
+            solvedYaw = freeYaw;
+        }
+        if (rebase) {
+            this.committedRescueTicks = 0;
+        }
 
         // A hazard that spans the flight path front-on has no pitch that clears it, only a heading that goes
         // around it. Try turning before spending a rocket or riding the impact in: stop at the first offset
         // that survives the whole horizon, and only switch off the current best for a >=2-tick gain (or for
         // reaching the full horizon outright, when the current best doesn't), so the yaw doesn't flap between
         // two offsets from one tick to the next.
-        if (survivedTicks < ticks) {
+        final int straightSurvived = survivedTicks;
+        if (survivedTicks < ticks && rebase) {
             search:
             for (final float magnitude : YAW_RESCUE_OFFSETS) {
                 for (final float sign : new float[]{1f, -1f}) {
@@ -1487,11 +1542,12 @@ public final class ElytraBehavior implements Helper {
                 }
             }
         }
-        if (solvedYaw == yaw) {
+        if (rebase && solvedYaw == yaw) {
             // back to flying straight: clear the latch so a later turn, even to the same offset, logs again
             // as the new episode it is instead of being mistaken for the one that just ended
             this.lastLoggedYawOffset = 0;
         }
+        this.committedRescueYaw = solvedYaw;
 
         // No pitch at the chosen yaw keeps us clear for the whole horizon, or we are in lava: light a rocket
         // now if it would provably do better, rather than waiting until impact is imminent.
@@ -2249,6 +2305,32 @@ public final class ElytraBehavior implements Helper {
     void logVerbose(String message) {
         if (Baritone.settings().elytraChatSpam.value) {
             logDebug(message);
+        }
+    }
+
+    private void logCollision(boolean vertical) {
+        final BetterBlockPos feet = ctx.playerFeet();
+        final Vec3 pos = ctx.player().position();
+        final Vec3 motion = ctx.player().getDeltaMovement();
+        final boolean boosted = this.remainingFireworkTicks > 0 || this.getAttachedFirework().isPresent();
+        final String line;
+        if (vertical) {
+            final boolean ceiling = ctx.world().getBlockState(feet.above(2)).isCollisionShapeFullBlock(ctx.world(), feet.above(2));
+            final boolean floor = ctx.world().getBlockState(feet.below()).isCollisionShapeFullBlock(ctx.world(), feet.below());
+            final String side = ceiling && floor ? "both" : ceiling ? "ceiling" : floor ? "floor" : "neither";
+            line = String.format(Locale.ROOT,
+                    "collision: vbonk %s, vy %.2f speed %.2f pitch %.0f, boost %s, noPitch %d, at %.1f %.1f %.1f",
+                    side, motion.y, motion.length(), ctx.playerRotations().getPitch(), boosted ? "yes" : "no",
+                    this.noPitchTicks, pos.x, pos.y, pos.z);
+        } else {
+            line = String.format(Locale.ROOT,
+                    "collision: hbonk yaw %.0f vx %.2f vz %.2f speed %.2f pitch %.0f, boost %s, noPitch %d, at %.1f %.1f %.1f",
+                    ctx.playerRotations().getYaw(), motion.x, motion.z, motion.length(), ctx.playerRotations().getPitch(),
+                    boosted ? "yes" : "no", this.noPitchTicks, pos.x, pos.y, pos.z);
+        }
+        if (!line.equals(this.lastCollisionLine)) {
+            this.lastCollisionLine = line;
+            FlightLog.log(line);
         }
     }
 }

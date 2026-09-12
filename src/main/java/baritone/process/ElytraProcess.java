@@ -1378,12 +1378,16 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         final double courseX = pos.x - this.flightFrom.x;
         final double courseZ = pos.z - this.flightFrom.z;
         final int leg = Baritone.settings().elytraPathLegLength.value;
+        final long anchorX = Baritone.settings().elytraRouteAnchorX.value;
+        final long anchorZ = Baritone.settings().elytraRouteAnchorZ.value;
+        final boolean anchored = anchorX != Long.MIN_VALUE && anchorZ != Long.MIN_VALUE
+                && (anchorX != this.flightDestination.x || anchorZ != this.flightDestination.z);
         final String course = courseX * courseX + courseZ * courseZ < 100 * 100 ? ""
                 : String.format(Locale.ROOT, ", course yaw %.1f with the destination at yaw %.1f (%s)",
                 Math.toDegrees(Math.atan2(-courseX, courseZ)),
                 Math.toDegrees(Math.atan2(-(this.flightDestination.x + 0.5 - this.flightFrom.x),
                         this.flightDestination.z + 0.5 - this.flightFrom.z)),
-                leg > 0 ? "legs of " + leg + " blocks" : "aimed at the destination");
+                leg > 0 ? "legs of " + leg + " blocks" + (anchored ? " on the anchored line" : "") : "aimed at the destination");
         FlightLog.log(String.format(Locale.ROOT,
                 "flight: ended after %d ticks %s at %.1f %.1f %.1f, %.0f blocks from where it started (%.0f at the farthest)%s, %.0f blocks travelled at %.2f b/t on average (%.1f blocks/s, top %.2f b/t, %d ticks under %.1f b/t)%s, rockets %d, server corrections %d, solver boost x%.2f +%d ticks, relight under %.2f b/t, wall hits %d, ceiling or floor hits %d, detour retries %d (fine path kept %d)%s%s, state %s",
                 this.flyingTicks, where, pos.x, pos.y, pos.z, pos.distanceTo(this.flightFrom), this.flightFarthest,
