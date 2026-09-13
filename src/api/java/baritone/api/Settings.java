@@ -1635,6 +1635,8 @@ public final class Settings {
      */
     public final Setting<Integer> elytraLavaWalkOutSeconds = new Setting<>(10);
 
+    public final Setting<Integer> elytraCirclingSeconds = new Setting<>(5);
+
     /**
      * Write a line per tick for the first moments of every takeoff: what the launch spot measured, where the
      * flight path was asked to start, and then, tick by tick, where the path's first node actually is.

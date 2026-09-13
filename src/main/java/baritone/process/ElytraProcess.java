@@ -194,7 +194,6 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     /** How far below a pinned glide has to be clear of lava before it is allowed to set itself down. */
     private static final int TAKEOFF_PINNED_SAFE_DROP = 12;
     private static final int CIRCLING_RADIUS = 24;
-    private static final int CIRCLING_TICKS = 200;
     private static final int CIRCLING_MIN_FAILURES = 3;
     private static final int CIRCLING_WALK_ON_TICKS = 20 * 60;
     private static final int CIRCLING_WALK_ON_RADIUS = 32;
@@ -230,6 +229,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private boolean lavaPathRequested;
     /** How far from our feet the walk out of the lava looks for somewhere to stand. */
     private static final int LAVA_EXIT_RADIUS = 5;
+    private static final int LAVA_EXIT_RADIUS_WIDE = 24;
     /** How long the walk may head for one place without getting closer to it before it tries another. */
     private static final int LAVA_EXIT_STALL_TICKS = 60;
     /** How long we may be out of the lava, bobbing at its surface, without that ending the stay in it. */
@@ -1680,7 +1680,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             this.circlingSetDown = false;
             return false;
         }
-        if (!this.circlingDetected && now - this.circleAnchorTick >= CIRCLING_TICKS
+        if (!this.circlingDetected && now - this.circleAnchorTick >= 20L * Math.max(1, Baritone.settings().elytraCirclingSeconds.value)
                 && failures - this.circleFailuresAtAnchor >= CIRCLING_MIN_FAILURES) {
             this.circlingDetected = true;
             FlightLog.log(String.format(Locale.ROOT,
@@ -1994,11 +1994,14 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             }
             this.lavaExitSearchTick = now;
             final BetterBlockPos feet = ctx.playerFeet();
-            this.lavaExit = findLavaExit(feet);
+            this.lavaExit = findLavaExit(feet, 1, LAVA_EXIT_RADIUS);
+            if (this.lavaExit == null) {
+                this.lavaExit = findLavaExit(feet, LAVA_EXIT_RADIUS + 1, LAVA_EXIT_RADIUS_WIDE);
+            }
             if (this.lavaExit == null) {
                 if (!this.lavaNoExitNoted) {
                     this.lavaNoExitNoted = true;
-                    FlightLog.log("lava: nowhere to stand within " + LAVA_EXIT_RADIUS + " blocks of " + feet + ", back to the elytra");
+                    FlightLog.log("lava: nowhere to stand within " + LAVA_EXIT_RADIUS_WIDE + " blocks of " + feet + ", back to the elytra");
                 }
                 return null;
             }
@@ -2019,7 +2022,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      * them or one block up, that a straight walk through the pool gets to; of the nearest ones, the one most towards
      * the destination. {@code null} if there is none.
      */
-    private BetterBlockPos findLavaExit(final BetterBlockPos feet) {
+    private BetterBlockPos findLavaExit(final BetterBlockPos feet, final int fromRing, final int toRing) {
         final BlockStateInterface bsi = new BlockStateInterface(ctx);
         final BetterBlockPos dest = this.behavior != null ? this.behavior.destination : null;
         final double toDestX = dest == null ? 0 : dest.x - feet.x;
@@ -2027,7 +2030,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         final double toDest = Math.max(1, Math.hypot(toDestX, toDestZ));
         BetterBlockPos best = null;
         double bestScore = 0;
-        for (int r = 1; r <= LAVA_EXIT_RADIUS && best == null; r++) {
+        for (int r = fromRing; r <= toRing && best == null; r++) {
             for (int dx = -r; dx <= r; dx++) {
                 for (int dz = -r; dz <= r; dz++) {
                     if (Math.max(Math.abs(dx), Math.abs(dz)) != r) {
@@ -2079,6 +2082,10 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 final int z = (int) Math.floor(feet.z + 0.5 + dz * i / steps + sideZ * side);
                 if (x == spot.x && z == spot.z || x == feet.x && z == feet.z) {
                     continue;
+                }
+                final BlockPos below = new BlockPos(x, feet.y - 1, z);
+                if (!MovementHelper.isLava(ctx.world().getBlockState(below)) && MovementHelper.fullyPassable(ctx, below)) {
+                    return false;
                 }
                 // our feet and our head, and for a spot one block up the height the head rises to on the way onto it
                 for (int y = feet.y; y <= spot.y + 1; y++) {
