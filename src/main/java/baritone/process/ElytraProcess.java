@@ -193,6 +193,12 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private static final float TAKEOFF_PINNED_SINK_PITCH = 40.0F;
     /** How far below a pinned glide has to be clear of lava before it is allowed to set itself down. */
     private static final int TAKEOFF_PINNED_SAFE_DROP = 12;
+    private static final int CIRCLING_RADIUS = 24;
+    private static final int CIRCLING_TICKS = 200;
+    private static final int CIRCLING_MIN_FAILURES = 3;
+    private static final int CIRCLING_WALK_ON_TICKS = 20 * 60;
+    private static final int CIRCLING_WALK_ON_RADIUS = 32;
+    private static final double CIRCLING_SINK_MAX_SPEED = 0.6;
     /**
      * How far we have to move sideways, or drop, for the ladder to consider itself at a new spot and start over
      * from the top.
@@ -208,6 +214,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private int takeoffAirborneTicks;
     private boolean walkOffImpossible;
     private boolean takeoffBoostPending;
+    private boolean mealPauseLogged;
     /**
      * Ticks since a takeoff opened the elytra, or {@code -1} outside a takeoff. Only the server can shut an
      * elytra again, so one that is shut while we are still in the air this soon after opening it is a takeoff
@@ -273,6 +280,15 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private int pinnedTicks;
     /** The path node the flight was nearest to last tick, to tell a pin from a squeeze that is still moving. */
     private int lastNear;
+    private Vec3 circleAnchor;
+    private int circleAnchorTick;
+    private int circleFailuresAtAnchor;
+    private boolean circlingDetected;
+    private boolean circlingSetDown;
+    private float circlingSinkYaw;
+    private BetterBlockPos walkOnFrom;
+    private int walkOnTick;
+    private boolean walkOnAfterCircling;
     /**
      * The takeoff journal: records what a launch was measured and asked to do, so a takeoff that flies into
      * terrain anyway can be told apart as either a bad clearance measurement or the path being silently
@@ -434,6 +450,19 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         }
 
         trackLava();
+        if (!ctx.player().isFallFlying() && this.state != State.LANDING && this.behavior.holdingForMeal()
+                && (ctx.player().onGround() || ctx.player().isInLava() || ctx.player().isInWater())) {
+            this.lavaExitProgressTick++;
+            this.takeoffProgressTick++;
+            if (!this.mealPauseLogged) {
+                this.mealPauseLogged = true;
+                FlightLog.log("meal: Baritone paused " + (ctx.player().isInLava() ? "in lava" : ctx.player().isInWater() ? "in water" : "on the ground")
+                        + " for an emergency meal");
+            }
+            baritone.getInputOverrideHandler().clearAllKeys();
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
+        this.mealPauseLogged = false;
         if (!ctx.player().isFallFlying() && ctx.player().isInLava()) {
             return lavaTakeoff();
         }
@@ -573,9 +602,26 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                         new Rotation(ctx.playerRotations().getYaw(), TAKEOFF_PINNED_SINK_PITCH), false);
                 return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
             }
+            if (this.state != State.LANDING && !this.goingToLandingSpot && circling() && groundBelowIsSafe()
+                    && (this.circlingSetDown || Math.hypot(ctx.player().getDeltaMovement().x, ctx.player().getDeltaMovement().z) < CIRCLING_SINK_MAX_SPEED)) {
+                if (!this.circlingSetDown) {
+                    this.circlingSetDown = true;
+                    final Vec3 from = ctx.player().position();
+                    final Vec3 to = new Vec3(this.circleAnchor.x, from.y, this.circleAnchor.z);
+                    this.circlingSinkYaw = from.distanceTo(to) > 2
+                            ? RotationUtils.calcRotationFromVec3d(from, to, ctx.playerRotations()).getYaw()
+                            : ctx.playerRotations().getYaw();
+                    logDirect("Flying in circles in the same spot with no path out - setting down to walk on towards the goal before taking off again.");
+                }
+                this.walkOnFrom = ctx.playerFeet();
+                this.walkOnTick = ctx.player().tickCount;
+                baritone.getLookBehavior().updateTarget(
+                        new Rotation(this.circlingSinkYaw, TAKEOFF_PINNED_SINK_PITCH), false);
+                return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+            }
 
             behavior.tick();
-            if (this.takeoffBoostPending) {
+            if (this.takeoffBoostPending && !this.behavior.holdingForMeal()) {
                 // a takeoff boost that couldn't be used the moment the elytra opened. after behavior.tick() so
                 // that it doesn't fight the boost bookkeeping if the solver already decided to use one
                 this.takeoffBoostPending = false;
@@ -621,6 +667,10 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 logDirect("Not taking off, because elytra durability or fireworks are so low that I would immediately emergency land anyway.");
                 onLostControl();
                 return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+            }
+            if (walkOnAfterSettingDown()) {
+                this.walkOnAfterCircling = true;
+                return standingTakeoff();
             }
             if (this.walkOffImpossible) {
                 // there is nothing to walk off of around here, and we already spent a couple of seconds of
@@ -859,6 +909,8 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      * torn down and handed the goal again, so a restart resumes where the ladder left off.
      */
     private PathingCommand standingTakeoff() {
+        final boolean afterCircling = this.walkOnAfterCircling;
+        this.walkOnAfterCircling = false;
         this.walkOffImpossible = true;
         this.goal = null;
         this.takeoffStallTicks = 0;
@@ -876,6 +928,10 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         // effort if there is nothing to light at the end of it.
         if (!this.behavior.selectFirework()) {
             return abortTakeoff("There is no spot to jump off from, and no fireworks in my hotbar to take off from here with. ");
+        }
+        if (afterCircling) {
+            this.takeoffStage = Stage.RELOCATE;
+            this.relocations = MAX_RELOCATIONS;
         }
 
         // How far above our feet a takeoff would have somewhere to go. 0 means right here; a positive number
@@ -915,7 +971,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             this.takeoffStage = Stage.RELOCATE;
         }
         if (this.takeoffStage == Stage.RELOCATE) {
-            final PathingCommand walk = walkToLaunch(feet);
+            final PathingCommand walk = walkToLaunch(feet, afterCircling);
             if (walk != null) {
                 return walk;
             }
@@ -1087,7 +1143,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      * or the top of a fungus canopy, neither of which any amount of jumping or climbing on the spot can fix.
      * {@code null} when there is nowhere better within range, or we have already moved twice.
      */
-    private PathingCommand walkToLaunch(BetterBlockPos feet) {
+    private PathingCommand walkToLaunch(BetterBlockPos feet, boolean afterCircling) {
         // Two walks to spots this search measured as launchable, and no more: a spot walked to twice without a
         // takeoff working from it just gets re-offered by measuring again. Past that, the only relocation left
         // is one that goes somewhere new - on towards the goal, digging if it has to - which starts this count
@@ -1127,7 +1183,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             this.walkingOnwards = true;
             // it ends on ground nobody has measured yet, which gets its own two walks to measured spots
             this.relocations = 0;
-            what = (spotsSpent
+            what = (afterCircling
+                    ? "the flight here went in circles, walking on towards the goal before taking off again"
+                    : spotsSpent
                     ? "the spots around here have been tried twice already, walking on towards the goal instead"
                     : "no spot around here works either, walking on towards the goal to look further")
                     + " (leg " + this.onwardLegs + " of " + MAX_ONWARD_LEGS + ")";
@@ -1298,6 +1356,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         this.flightSlowTicks = 0;
         this.flightPinNoted = false;
         this.flightPinDecisionNoted = false;
+        this.circleAnchor = null;
+        this.circlingDetected = false;
+        this.circlingSetDown = false;
         this.fallFromY = Double.NaN;
         this.behavior.takeNoPitchTicks();
         this.launchedFromSpot = this.takeoffSpot != null && this.takeoffStage == Stage.LAUNCH;
@@ -1600,6 +1661,49 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             }
         }
         return false;
+    }
+
+    private boolean circling() {
+        final Vec3 pos = ctx.player().position();
+        final int failures = this.behavior.pathFailureCount();
+        final int now = ctx.player().tickCount;
+        final boolean away = this.circleAnchor != null
+                && pos.distanceTo(this.circleAnchor) > (this.circlingDetected ? 2 * CIRCLING_RADIUS : CIRCLING_RADIUS);
+        if (this.circleAnchor == null || failures < this.circleFailuresAtAnchor || now < this.circleAnchorTick || away) {
+            if (away) {
+                this.walkOnFrom = null;
+            }
+            this.circleAnchor = pos;
+            this.circleAnchorTick = now;
+            this.circleFailuresAtAnchor = failures;
+            this.circlingDetected = false;
+            this.circlingSetDown = false;
+            return false;
+        }
+        if (!this.circlingDetected && now - this.circleAnchorTick >= CIRCLING_TICKS
+                && failures - this.circleFailuresAtAnchor >= CIRCLING_MIN_FAILURES) {
+            this.circlingDetected = true;
+            FlightLog.log(String.format(Locale.ROOT,
+                    "circling: %d ticks within %d blocks of %.1f %.1f %.1f with %d failed path searches, %s",
+                    now - this.circleAnchorTick, CIRCLING_RADIUS,
+                    this.circleAnchor.x, this.circleAnchor.y, this.circleAnchor.z,
+                    failures - this.circleFailuresAtAnchor,
+                    groundBelowIsSafe()
+                            ? "setting down on the floor below to walk on towards the goal"
+                            : "no floor within " + TAKEOFF_PINNED_SAFE_DROP + " blocks below or lava on the way, setting down once there is one"));
+        }
+        return this.circlingDetected;
+    }
+
+    private boolean walkOnAfterSettingDown() {
+        final BetterBlockPos from = this.walkOnFrom;
+        if (from == null) {
+            return false;
+        }
+        this.walkOnFrom = null;
+        final int age = ctx.player().tickCount - this.walkOnTick;
+        return age >= 0 && age <= CIRCLING_WALK_ON_TICKS
+                && horizontalDistSq(from, ctx.playerFeet()) <= CIRCLING_WALK_ON_RADIUS * CIRCLING_WALK_ON_RADIUS;
     }
 
     /**

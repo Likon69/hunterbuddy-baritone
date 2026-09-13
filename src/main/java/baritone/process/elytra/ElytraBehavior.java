@@ -68,6 +68,7 @@ import java.util.*;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
 
@@ -104,6 +105,8 @@ public final class ElytraBehavior implements Helper {
     private final ElytraProcess process;
 
     private static final int FIREWORK_COOLDOWN_TICKS = 10;
+    private static final int FIREWORK_HOLD_MAX_TICKS = 40;
+    private static final int FIREWORK_HOLD_RESET_TICKS = 20;
     /**
      * How far from where it was asked to start a path may begin before {@link PathManager#noteStart} writes it
      * down: past one neighbouring 4-block node, which is as far as an ordinary search ever moves a start.
@@ -131,6 +134,10 @@ public final class ElytraBehavior implements Helper {
      * Remaining cool-down ticks after the player's position and rotation are reset by the server
      */
     private int remainingSetBackTicks;
+    private int fireworkHoldTicks;
+    private int fireworkHoldNote;
+    private int fireworkHoldOffTicks;
+    private final AtomicInteger pathFailures = new AtomicInteger();
 
     public boolean landingMode;
 
@@ -298,6 +305,7 @@ public final class ElytraBehavior implements Helper {
                         if (ex != null) {
                             final Throwable cause = ex.getCause();
                             if (cause instanceof PathCalculationException) {
+                                ElytraBehavior.this.pathFailures.incrementAndGet();
                                 logDirect("Failed to recompute segment");
                                 repackNearPlayer("segment recomputation failed");
                             } else {
@@ -340,6 +348,7 @@ public final class ElytraBehavior implements Helper {
                                 // pathRecalcSegment. repackNearPlayer hops to the main thread itself; the
                                 // rest just sets fields, read back next tick in attemptNextSegment.
                                 repackNearPlayer("next segment computation failed");
+                                ElytraBehavior.this.pathFailures.incrementAndGet();
                                 if (pathStart.distanceSq(ElytraBehavior.this.destination) <= 48 * 48) {
                                     // Same radius the landing-spot search uses for "close enough": a resumed
                                     // search failing this close to the destination means there's nothing left
@@ -1162,6 +1171,16 @@ public final class ElytraBehavior implements Helper {
     }
 
     public void onTick() {
+        if (Baritone.settings().elytraHoldFireworks.value) {
+            this.fireworkHoldTicks++;
+            this.fireworkHoldOffTicks = 0;
+        } else {
+            this.fireworkHoldOffTicks++;
+            if (this.fireworkHoldOffTicks >= FIREWORK_HOLD_RESET_TICKS) {
+                this.fireworkHoldTicks = 0;
+                this.fireworkHoldNote = 0;
+            }
+        }
         synchronized (this.context.cullingLock) {
             this.onTick0();
         }
@@ -1715,7 +1734,24 @@ public final class ElytraBehavior implements Helper {
         return best == null || score > best.dot ? new PitchResult(pitch, score, steps) : best;
     }
 
+    public boolean holdingForMeal() {
+        return Baritone.settings().elytraHoldFireworks.value && this.fireworkHoldTicks <= FIREWORK_HOLD_MAX_TICKS;
+    }
+
     private void tickUseFireworks(final Vec3 start, final Vec3 goingTo, final boolean isBoosted, final boolean forceUseFirework, final boolean inLava) {
+        if (Baritone.settings().elytraHoldFireworks.value) {
+            if (this.holdingForMeal()) {
+                if (this.fireworkHoldNote == 0) {
+                    this.fireworkHoldNote = 1;
+                    FlightLog.log("rocket: held while elytraHoldFireworks is set");
+                }
+                return;
+            }
+            if (this.fireworkHoldNote < 2) {
+                this.fireworkHoldNote = 2;
+                FlightLog.log("rocket: elytraHoldFireworks has been set for over " + FIREWORK_HOLD_MAX_TICKS + " ticks, lighting rockets again");
+            }
+        }
         // neither the setback delay nor a landing in progress is a reason to keep burning
         if (this.remainingSetBackTicks > 0 && !inLava) {
             logDebug("waiting for elytraFireworkSetbackUseDelay: " + this.remainingSetBackTicks);
@@ -1766,6 +1802,10 @@ public final class ElytraBehavior implements Helper {
         final int ticks = this.noPitchTicks;
         this.noPitchTicks = 0;
         return ticks;
+    }
+
+    public int pathFailureCount() {
+        return this.pathFailures.get();
     }
 
     /**
@@ -2436,19 +2476,70 @@ public final class ElytraBehavior implements Helper {
             final boolean ceiling = ctx.world().getBlockState(feet.above(2)).isCollisionShapeFullBlock(ctx.world(), feet.above(2));
             final boolean floor = ctx.world().getBlockState(feet.below()).isCollisionShapeFullBlock(ctx.world(), feet.below());
             final String side = ceiling && floor ? "both" : ceiling ? "ceiling" : floor ? "floor" : "neither";
+            final double up = (ceiling || (!ceiling && !floor)) ? 0.3 : 0;
+            final double down = (floor || (!ceiling && !floor)) ? 0.3 : 0;
+            final int[] cache = collisionCacheAwareness(0, 0, up, down);
             line = String.format(Locale.ROOT,
-                    "collision: vbonk %s, vy %.2f speed %.2f pitch %.0f, boost %s, noPitch %d, at %.1f %.1f %.1f",
+                    "collision: vbonk %s, vy %.2f speed %.2f pitch %.0f, boost %s, noPitch %d, at %.1f %.1f %.1f cache %d/%d",
                     side, motion.y, motion.length(), ctx.playerRotations().getPitch(), boosted ? "yes" : "no",
-                    this.noPitchTicks, pos.x, pos.y, pos.z);
+                    this.noPitchTicks, pos.x, pos.y, pos.z, cache[1], cache[0]);
         } else {
+            final int[] cache = collisionCacheAwareness(0.3, 0.3, 0, 0);
             line = String.format(Locale.ROOT,
-                    "collision: hbonk yaw %.0f vx %.2f vz %.2f speed %.2f pitch %.0f, boost %s, noPitch %d, at %.1f %.1f %.1f",
+                    "collision: hbonk yaw %.0f vx %.2f vz %.2f speed %.2f pitch %.0f, boost %s, noPitch %d, at %.1f %.1f %.1f cache %d/%d",
                     ctx.playerRotations().getYaw(), motion.x, motion.z, motion.length(), ctx.playerRotations().getPitch(),
-                    boosted ? "yes" : "no", this.noPitchTicks, pos.x, pos.y, pos.z);
+                    boosted ? "yes" : "no", this.noPitchTicks, pos.x, pos.y, pos.z, cache[1], cache[0]);
         }
         if (!line.equals(this.lastCollisionLine)) {
             this.lastCollisionLine = line;
             FlightLog.log(line);
         }
+    }
+
+    private int[] collisionCacheAwareness(double marginX, double marginZ, double marginUp, double marginDown) {
+        final AABB box = ctx.player().getBoundingBox();
+        final AABB grown = new AABB(
+                box.minX - marginX, box.minY - marginDown, box.minZ - marginZ,
+                box.maxX + marginX, box.maxY + marginUp, box.maxZ + marginZ
+        );
+        final int minX = fastFloor(grown.minX);
+        final int minY = fastFloor(grown.minY);
+        final int minZ = fastFloor(grown.minZ);
+        final int maxX = fastCeil(grown.maxX) - 1;
+        final int maxY = fastCeil(grown.maxY) - 1;
+        final int maxZ = fastCeil(grown.maxZ) - 1;
+        int total = 0;
+        int known = 0;
+        for (int x = minX; x <= maxX; x++) {
+            for (int y = minY; y <= maxY; y++) {
+                for (int z = minZ; z <= maxZ; z++) {
+                    final BlockPos bp = new BlockPos(x, y, z);
+                    final AABB blockBox = new AABB(bp);
+                    if (!aabbTouches(grown, blockBox) || aabbOverlaps(box, blockBox)) {
+                        continue;
+                    }
+                    if (ctx.world().getBlockState(bp).isAir()) {
+                        continue;
+                    }
+                    total++;
+                    if (nativeSolid(x, y, z)) {
+                        known++;
+                    }
+                }
+            }
+        }
+        return new int[] { total, known };
+    }
+
+    private static boolean aabbTouches(AABB a, AABB b) {
+        return a.minX <= b.maxX && a.maxX >= b.minX
+                && a.minY <= b.maxY && a.maxY >= b.minY
+                && a.minZ <= b.maxZ && a.maxZ >= b.minZ;
+    }
+
+    private static boolean aabbOverlaps(AABB a, AABB b) {
+        return a.minX < b.maxX && a.maxX > b.minX
+                && a.minY < b.maxY && a.maxY > b.minY
+                && a.minZ < b.maxZ && a.maxZ > b.minZ;
     }
 }

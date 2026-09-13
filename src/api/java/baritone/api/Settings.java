@@ -1583,6 +1583,9 @@ public final class Settings {
      */
     public final Setting<Integer> elytraFireworkExtraBoostTicks = new Setting<>(0);
 
+    @JavaOnly
+    public final Setting<Boolean> elytraHoldFireworks = new Setting<>(false);
+
     /**
      * Search with 4-block nodes first and, when that only produces a stub (an unfinished path that ends within
      * 64 blocks of where it started, meaning the search was boxed in), search again with 2-block nodes. Keeps
