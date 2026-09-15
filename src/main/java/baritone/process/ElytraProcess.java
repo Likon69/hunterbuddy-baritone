@@ -208,6 +208,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     /** The pitch a takeoff holds while it jumps, so the glide starts pointing up and down the goal line. */
     private static final float TAKEOFF_PITCH = -30.0F;
     private int takeoffStallTicks;
+    private int lastRungTick;
+    private int takeoffRounds;
+    private int takeoffRetryTick;
     private int standingTakeoffs;
     private int walkOffAttempts;
     private int takeoffAirborneTicks;
@@ -1144,6 +1147,11 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      * {@code null} when there is nowhere better within range, or we have already moved twice.
      */
     private PathingCommand walkToLaunch(BetterBlockPos feet, boolean afterCircling) {
+        if (ctx.player().tickCount - this.lastRungTick < 40) {
+            return this.goal != null
+                    ? new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH)
+                    : new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
         // Two walks to spots this search measured as launchable, and no more: a spot walked to twice without a
         // takeoff working from it just gets re-offered by measuring again. Past that, the only relocation left
         // is one that goes somewhere new - on towards the goal, digging if it has to - which starts this count
@@ -1191,6 +1199,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                     + " (leg " + this.onwardLegs + " of " + MAX_ONWARD_LEGS + ")";
         }
         this.state = State.WALK_TO_LAUNCH;
+        this.lastRungTick = ctx.player().tickCount;
         this.takeoffStallTicks = 0;
         takeoffProgressReset();
         logDirect("Nowhere to take off from here, " + what + ".");
@@ -1307,6 +1316,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private void ladderStartsAt(BetterBlockPos feet, int now) {
         this.takeoffStage = Stage.LAUNCH;
         this.standingTakeoffs = 0;
+        this.lastRungTick = 0;
+        this.takeoffRounds = 0;
+        this.takeoffRetryTick = 0;
         this.pillared = false;
         this.takeoffSpot = feet;
         this.takeoffSpotTick = now;
@@ -1548,6 +1560,8 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         this.relocations = 0;
         this.climbs = 0;
         this.onwardLegs = 0;
+        this.lastRungTick = 0;
+        this.takeoffRounds = 0;
         // ground a launch has just worked from is not ground to keep away from
         this.recentLaunches.clear();
         this.standingTakeoffs = 0;
@@ -2178,8 +2192,25 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     }
 
     private PathingCommand abortTakeoff(String reason) {
+        if (ctx.player().tickCount - this.takeoffRetryTick < 200) {
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
         FlightLog.log(String.format(Locale.ROOT, "abort: %sat %s, %s rung, launches %d, climbs %d, relocations %d",
                 reason, ctx.playerFeet(), this.takeoffStage, this.standingTakeoffs, this.climbs, this.relocations));
+        if (this.takeoffRounds < 2) {
+            this.takeoffRounds++;
+            this.takeoffRetryTick = ctx.player().tickCount;
+            this.takeoffStage = Stage.LAUNCH;
+            this.relocations = 0;
+            this.onwardLegs = 0;
+            this.standingTakeoffs = 0;
+            this.climbs = 0;
+            this.lastRungTick = 0;
+            this.takeoffStallTicks = 0;
+            takeoffProgressReset();
+            logDirect(reason + "Trying the whole takeoff ladder again (round " + (this.takeoffRounds + 1) + " of 3).");
+            return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+        }
         onLostControl();
         logDirect(reason + TAKEOFF_ADVICE_MSG);
         return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);

@@ -842,10 +842,10 @@ public final class ElytraBehavior implements Helper {
                 ));
             }
 
-            if (this.restartFromPlayer && ctx.player().isFallFlying()) {
+            if (this.restartFromPlayer
+                    && (ctx.player().isFallFlying() || ctx.player().tickCount - this.failedSegmentTick >= 40)) {
                 // Airborne, an open cube near the player is found almost at once since flying there at all
-                // means it isn't buried like the stuck resume node. Grounded there's nothing better to search
-                // from yet, so fall through to the ordinary retry below until flight resumes.
+                // means it isn't buried like the stuck resume node.
                 this.restartFromPlayer = false;
                 logVerbose("Next segment start unreachable, re-pathing from the player");
                 this.pathRecalcSegment(OptionalInt.empty());
