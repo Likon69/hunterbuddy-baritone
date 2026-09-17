@@ -4,7 +4,7 @@ Fork of dekrom's Baritone (`v1.3.0-1.21.11`, Mojang mappings) with the elytra ch
 addon needs for long nether flights on 2b2t. Only the elytra code is touched.
 
 - Build: `./gradlew :fabric:build -Pmod_version=1.3.0-hbN-1.21.11`, output in
-  `dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb38** (change 24 not flown yet).
+  `dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb46**.
 - Logs: `#elytraChatSpam true` and `#chatDebug true`.
 - Patched native pathfinder: [Likon69/nether-pathfinder](https://github.com/Likon69/nether-pathfinder).
 
@@ -34,6 +34,13 @@ addon needs for long nether flights on 2b2t. Only the elytra code is touched.
 22. The lava escape never pitches down, since the simulation sees lava as air.
 23. When the aimed point is under 4 blocks away, the last heading is held for up to 10 ticks, without rockets, if it stays clear for 5 ticks.
 24. A chunk can no longer be freed while a raytrace reads it: raytraces share a lock that the cache cull, chunk replacement and context free take exclusively (a second native crash).
+25. A flight that circles one spot while path searches keep failing sets down and walks on towards the goal (`elytraCirclingSeconds`).
+26. Rockets are held, and the walk stops off the ground, while the addon eats at emergency health (`elytraHoldFireworks`).
+27. Every collision log says how much of the trajectory the pathfinder cache already knew.
+28. The lava walk-out looks for a shore up to 24 blocks away, across lava, as long as there is a floor the whole way.
+29. A failing segment re-paths from the player on the ground as well as in the air, at most once every 40 ticks, instead of retrying the same buried resume point for ever.
+30. The takeoff spends at most one rung every two seconds, and runs the whole ladder three times before giving up.
+31. The stay in lava survives a lost control, so the walk-out after `elytraLavaWalkOutSeconds` is reachable instead of restarting from zero every two ticks.
 
 ## Settings added by this fork
 
@@ -55,6 +62,12 @@ addon needs for long nether flights on 2b2t. Only the elytra code is touched.
 | `elytraRouteAnchorZ` | `Long.MIN_VALUE` | Z of that fixed point (off until X is also set) |
 | `elytraLavaWalkOutSeconds` | `10` | Seconds in lava before the takeoff gives up on the elytra and walks out |
 | `obsidianReserve` | `25` | Obsidian never spent by a pillar, a bridge or anything else Baritone places |
+| `elytraCirclingSeconds` | `5` | Seconds circling one spot with failing searches before setting down and walking on |
+| `elytraPathDetourRatio` | `1.6` | How much a 4-block path may wander before a 2-block search is tried against it |
+| `elytraHoldFireworks` | `false` | Steer without lighting a rocket, and stop off the ground, while the addon eats |
+| `elytraFlightLog` | `true` | Keep a `[flight]` record of every flight in `latest.log`, never in chat |
+| `elytraTakeoffJournal` | `false` | Log where the first path node sits during the first ticks of a launch |
+| `elytraTakeoffJournalTicks` | `40` | How many flight ticks that journal covers |
 
 ## Credits
 
