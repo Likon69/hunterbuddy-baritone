@@ -393,7 +393,6 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         this.lavaPathRequested = false;
         // the flight this described is no longer ours once control is lost mid-air; whatever happens to it next isn't a takeoff outcome.
         this.launchedFromSpot = false;
-        forgetLava();
         this.pillarTargetY = 0;
         destroyBehaviorAsync();
     }
