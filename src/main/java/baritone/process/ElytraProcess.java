@@ -1927,7 +1927,8 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             if (out != null) {
                 return out;
             }
-            // nowhere to walk to: the elytra is all there is
+
+            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
         }
         if (!ctx.player().onGround() && openElytra()) {
             this.state = State.START_FLYING;
