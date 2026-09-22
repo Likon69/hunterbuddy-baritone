@@ -254,6 +254,18 @@ public final class NetherPathfinderContext {
     }
 
     /**
+     * The heights the octree holds, in an array of eight entries of sixteen rows. A ray ending outside them
+     * indexes past the end of that array and reads whatever follows the chunk, which crashed twice on
+     * 2026-09-18 through {@code isVisible}. Only the two single-ray calls are bounded: the batched one is the
+     * hitbox check, whose corners reach past the roof on any climb.
+     */
+    private static final double OCTREE_HEIGHT = 128.0;
+
+    private static boolean outsideOctree(final double y) {
+        return y < 0.0 || y >= OCTREE_HEIGHT;
+    }
+
+    /**
      * Performs a raytrace from the given start position to the given end position, returning {@code true} if there is
      * visibility between the two points.
      *
@@ -267,6 +279,10 @@ public final class NetherPathfinderContext {
      */
     public boolean raytrace(final double startX, final double startY, final double startZ,
                             final double endX, final double endY, final double endZ) {
+        if (outsideOctree(startY) || outsideOctree(endY)) {
+            return false;
+        }
+
         this.chunkLock.readLock().lock();
         try {
             if (this.destroyed) {
@@ -287,6 +303,10 @@ public final class NetherPathfinderContext {
      * @return {@code true} if there is visibility between the points
      */
     public boolean raytrace(final Vec3 start, final Vec3 end) {
+        if (outsideOctree(start.y) || outsideOctree(end.y)) {
+            return false;
+        }
+
         this.chunkLock.readLock().lock();
         try {
             if (this.destroyed) {
