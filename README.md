@@ -1,10 +1,10 @@
 # hunterbuddy-baritone
 
-Fork of dekrom's Baritone (`v1.3.0-1.21.11`, Mojang mappings) with the elytra changes the HunterBuddy Meteor
-addon needs for long nether flights on 2b2t. Only the elytra code is touched.
+Fork of dekrom's Baritone (`v1.3.0-1.21.11`, Mojang mappings) with the elytra changes the [HunterBuddy](https://github.com/Likon69/HunterBuddy)
+Meteor addon needs for long nether flights on 2b2t. Only the elytra code is touched.
 
 - Build: `./gradlew :fabric:build -Pmod_version=1.3.0-hbN-1.21.11`, output in
-  `dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb46**.
+  `dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb50**.
 - Logs: `#elytraChatSpam true` and `#chatDebug true`.
 - Patched native pathfinder: [Likon69/nether-pathfinder](https://github.com/Likon69/nether-pathfinder).
 
@@ -41,6 +41,9 @@ addon needs for long nether flights on 2b2t. Only the elytra code is touched.
 29. A failing segment re-paths from the player on the ground as well as in the air, at most once every 40 ticks, instead of retrying the same buried resume point for ever.
 30. The takeoff spends at most one rung every two seconds, and runs the whole ladder three times before giving up.
 31. The stay in lava survives a lost control, so the walk-out after `elytraLavaWalkOutSeconds` is reachable instead of restarting from zero every two ticks.
+32. A pillar that would jump into a solid block three up breaks it first, instead of jumping into it and failing over and over.
+33. When launch, climb and relocate have all failed, the ladder tries digging three blocks straight up before giving up on the takeoff entirely.
+34. A movement that runs past its expected time logs what it was standing in, what was above it, whether it was on the ground, and what was in hand.
 
 ## Settings added by this fork
 
