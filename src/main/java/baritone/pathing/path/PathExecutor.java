@@ -244,11 +244,27 @@ public class PathExecutor implements IPathExecutor, Helper {
                 // ticksOnCurrent is greater than recalculateCost + 100
                 // this is why we cache cost at the beginning, and don't recalculate for this comparison every tick
                 logDebug("This movement has taken too long (" + ticksOnCurrent + " ticks, expected " + currentMovementOriginalCostEstimate + "). Cancelling.");
+                logStuckMovement(movement);
                 cancel();
                 return true;
             }
         }
         return canCancel; // movement is in progress, but if it reports cancellable, PathingBehavior is good to cut onto the next path
+    }
+
+    private void logStuckMovement(IMovement movement) {
+        BetterBlockPos src = movement.getSrc();
+        StringBuilder column = new StringBuilder();
+        for (int dy = -1; dy <= 3; dy++) {
+            column.append(" +").append(dy).append('=').append(BlockStateInterface.get(ctx, src.above(dy)).getBlock().getDescriptionId().replace("block.minecraft.", ""));
+        }
+        Vec3 pos = ctx.player().position();
+        baritone.process.elytra.FlightLog.log(String.format(Locale.ROOT,
+                "stuck movement: %s from %s to %s, at %.2f %.2f %.2f, on ground %s, crouching %s, holding %s, column%s",
+                movement.getClass().getSimpleName(), src, movement.getDest(), pos.x, pos.y, pos.z,
+                ctx.player().onGround(), ctx.player().isCrouching(),
+                ctx.player().getMainHandItem().getItem().getDescriptionId().replace("item.minecraft.", "").replace("block.minecraft.", ""),
+                column));
     }
 
     private Tuple<Double, BlockPos> closestPathPos(IPath path) {

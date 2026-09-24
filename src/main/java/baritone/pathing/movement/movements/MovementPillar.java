@@ -41,13 +41,40 @@ import java.util.Set;
 
 public class MovementPillar extends Movement {
 
+    private boolean breakOverJump;
+
     public MovementPillar(IBaritone baritone, BetterBlockPos start, BetterBlockPos end) {
         super(baritone, start, end, new BetterBlockPos[]{start.above(2)}, start);
     }
 
     @Override
     public double calculateCost(CalculationContext context) {
-        return cost(context, src.x, src.y, src.z);
+        double cost = cost(context, src.x, src.y, src.z);
+        this.breakOverJump = false;
+        BlockState fromState = context.get(src.x, src.y, src.z);
+        boolean climbing = fromState.getBlock() == Blocks.LADDER || fromState.getBlock() == Blocks.VINE || MovementHelper.isWater(fromState);
+        if (cost < COST_INF && !climbing) {
+            double overJump = overJumpCost(context, src.x, src.y, src.z);
+            if (overJump > 0 && overJump < COST_INF) {
+                this.breakOverJump = true;
+                cost += overJump;
+            }
+        }
+        return cost;
+    }
+
+    public static double overJumpCost(CalculationContext context, int x, int y, int z) {
+        BlockState over = context.get(x, y + 3, z);
+        if (MovementHelper.canWalkThrough(context, x, y + 3, z, over)) {
+            return 0;
+        }
+        if (!MovementHelper.canWalkThrough(context, x, y + 2, z, context.get(x, y + 2, z))) {
+            return 0;
+        }
+        if (context.get(x, y + 4, z).getBlock() instanceof FallingBlock) {
+            return COST_INF;
+        }
+        return MovementHelper.getMiningDurationTicks(context, x, y + 3, z, over, false);
     }
 
     @Override
@@ -272,6 +299,17 @@ public class MovementPillar extends Movement {
 
     @Override
     protected boolean prepared(MovementState state) {
+        BetterBlockPos over = src.above(3);
+        if (this.breakOverJump && MovementHelper.canWalkThrough(ctx, src.above(2)) && !MovementHelper.canWalkThrough(ctx, over)) {
+            MovementHelper.switchToBestToolFor(ctx, BlockStateInterface.get(ctx, over));
+            Rotation toOver = RotationUtils.reachable(ctx, over, ctx.playerController().getBlockReachDistance())
+                    .orElse(RotationUtils.calcRotationFromVec3d(ctx.playerHead(), VecUtils.getBlockPosCenter(over), ctx.playerRotations()));
+            state.setTarget(new MovementState.MovementTarget(toOver, true));
+            if (ctx.isLookingAt(over) || ctx.playerRotations().isReallyCloseTo(toOver)) {
+                state.setInput(Input.CLICK_LEFT, true);
+            }
+            return false;
+        }
         if (ctx.playerFeet().equals(src) || ctx.playerFeet().equals(src.below())) {
             Block block = BlockStateInterface.getBlock(ctx, src.below());
             if (block == Blocks.LADDER || block == Blocks.VINE) {

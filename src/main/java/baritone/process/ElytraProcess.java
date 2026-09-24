@@ -149,6 +149,8 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private static final int MAX_RELOCATIONS = 2;
     /** How many times one takeoff may climb before admitting defeat. */
     private static final int MAX_CLIMBS = 2;
+    private static final int MAX_DIGS = 4;
+    private static final int DIG_HEIGHT = 3;
     /**
      * How many 48-block legs towards the goal in a row may get nowhere before the ladder admits defeat. A leg
      * that reaches its point starts the count over. Only a leg that stalls or finds no path counts against it -
@@ -251,6 +253,8 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private int lavaExitSearchTick;
     /** Whether this takeoff sequence has already climbed once. One climb per spot: a stance that still fails after it is walled in some other way height can't fix. */
     private boolean pillared;
+    private boolean digging;
+    private int digs;
     /** The feet-Y the current pillar is climbing to. */
     private int pillarTargetY;
     /**
@@ -472,6 +476,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         if (calcFailed) {
             FlightLog.log("ladder: the walking path for " + this.state + " could not be computed");
             if (this.state == State.PILLAR_UP) {
+                this.digging = false;
                 // Nothing to climb to that a path can reach; the next rung looks somewhere else instead of
                 // asking for the same climb again.
                 this.takeoffStage = Stage.RELOCATE;
@@ -813,6 +818,15 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
         if (this.state == State.PILLAR_UP) {
             if (ctx.player().onGround() && ctx.playerFeet().y >= this.pillarTargetY) {
+                if (this.digging) {
+                    this.digging = false;
+                    FlightLog.log(String.format(Locale.ROOT, "dig: reached y=%d at %s, the ladder starts over from here (dig %d of %d)",
+                            this.pillarTargetY, ctx.playerFeet(), this.digs, MAX_DIGS));
+                    ladderStartsAt(ctx.playerFeet(), ctx.player().tickCount);
+                    this.relocations = 0;
+                    this.onwardLegs = 0;
+                    this.climbs = 0;
+                }
                 // Climbed high enough: try the launch again from up here. this.pillared stays set, so if it
                 // still doesn't work the ladder moves on to walking somewhere else instead of climbing twice.
                 baritone.getPathingBehavior().secretInternalSegmentCancel();
@@ -845,6 +859,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 this.goal = null;
                 this.takeoffStage = Stage.RELOCATE;
                 return standingTakeoff();
+            }
+            if (this.digging) {
+                return new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH);
             }
             return new PathingCommandContext(this.goal, PathingCommandType.SET_GOAL_AND_PATH, new NoBreakCalculationContext(baritone));
         }
@@ -984,7 +1001,11 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         if (lift == 0 && this.standingTakeoffs < MAX_STANDING_TAKEOFFS) {
             return launchFromHere(feet);
         }
-        return abortTakeoff("Tried taking off from here, climbing out of here, and walking somewhere better, and none of it worked. ");
+        final PathingCommand dig = digUp(feet);
+        if (dig != null) {
+            return dig;
+        }
+        return abortTakeoff("Tried taking off from here, climbing out of here, walking somewhere better and digging up, and none of it worked. ");
     }
 
     /**
@@ -1096,6 +1117,33 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
      * climb that could only be made by breaking fails to compute and moves the ladder on. {@code null} when there
      * is nothing above worth climbing to, or no way to climb, so the caller can move on to the next rung.
      */
+    private PathingCommand digUp(BetterBlockPos feet) {
+        if (this.digs >= MAX_DIGS) {
+            return null;
+        }
+        if (feet.y + DIG_HEIGHT > 118) {
+            return null;
+        }
+        if (!Baritone.settings().allowPlace.value || !baritone.getInventoryBehavior().hasGenericThrowaway()
+                || baritone.getInventoryBehavior().spendableThrowawayCount() < DIG_HEIGHT) {
+            FlightLog.log("dig: nothing to pillar with at " + feet);
+            return null;
+        }
+        this.digs++;
+        this.digging = true;
+        this.pillared = true;
+        this.pillarTargetY = feet.y + DIG_HEIGHT;
+        this.standingTakeoffs = 0;
+        this.goal = new GoalBlock(feet.x, this.pillarTargetY, feet.z);
+        this.state = State.PILLAR_UP;
+        this.takeoffStallTicks = 0;
+        takeoffProgressReset();
+        logDirect("Nothing else worked, digging " + DIG_HEIGHT + " blocks up to try again from there.");
+        FlightLog.log(String.format(Locale.ROOT, "dig: %d blocks up from %s to y=%d, breaking what is in the way, dig %d of %d",
+                DIG_HEIGHT, feet, this.pillarTargetY, this.digs, MAX_DIGS));
+        return new PathingCommand(this.goal, PathingCommandType.SET_GOAL_AND_PATH);
+    }
+
     private PathingCommand climbToLaunch(BetterBlockPos feet, int lift) {
         if (lift <= 0 || this.pillared || !Baritone.settings().elytraTakeoffPillar.value) {
             return null;
@@ -1126,6 +1174,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             return null;
         }
         this.pillared = true;
+        this.digging = false;
         this.climbs++;
         this.pillarTargetY = feet.y + lift;
         this.standingTakeoffs = 0;
@@ -1558,6 +1607,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
         // the journal belongs to the takeoff, not to the flight; it stops itself after its own ticks
         this.relocations = 0;
         this.climbs = 0;
+        this.digs = 0;
         this.onwardLegs = 0;
         this.lastRungTick = 0;
         this.takeoffRounds = 0;
