@@ -1,7 +1,7 @@
 # hunterbuddy-baritone
 
-Fork of dekrom's Baritone (`v1.3.0-1.21.11`, Mojang mappings) with the elytra changes the [HunterBuddy](https://github.com/Likon69/HunterBuddy)
-Meteor addon needs for long nether flights on 2b2t. Only the elytra code is touched.
+Fork of Baritone for **Minecraft 1.21.11 only** (`v1.3.0-1.21.11`, Mojang mappings), with the elytra changes the
+[HunterBuddy](https://github.com/Likon69/HunterBuddy) Meteor addon needs for long nether flights on 2b2t. Only the elytra code is touched.
 
 - Build: `./gradlew :fabric:build -Pmod_version=1.3.0-hbN-1.21.11`, output in
   `dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb50**.
@@ -74,4 +74,4 @@ Meteor addon needs for long nether flights on 2b2t. Only the elytra code is touc
 
 ## Credits
 
-Leijurv, Dekrom, and babbaj for nether-pathfinder.
+Leijurv and babbaj for nether-pathfinder.
