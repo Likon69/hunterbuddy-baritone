@@ -4,7 +4,7 @@ Fork of Baritone for **Minecraft 1.21.11 only** (`v1.3.0-1.21.11`, Mojang mappin
 [HunterBuddy](https://github.com/Likon69/HunterBuddy) Meteor addon needs for long nether flights on 2b2t. Only the elytra code is touched.
 
 - Build: `./gradlew :fabric:build -Pmod_version=1.3.0-hbN-1.21.11`, output in
-  `dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb50**.
+  `dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb51**.
 - Logs: `#elytraChatSpam true` and `#chatDebug true`.
 - Patched native pathfinder: [Likon69/nether-pathfinder](https://github.com/Likon69/nether-pathfinder).
 
@@ -25,25 +25,25 @@ Fork of Baritone for **Minecraft 1.21.11 only** (`v1.3.0-1.21.11`, Mojang mappin
 13. When no pitch clears the horizon, the rescue also tries turning 30, 60 or 90 degrees either way.
 14. A launch that falls straight back down counts against the same spot, so it is not repeated in a loop.
 15. The nether-pathfinder chunk cache takes its lock in every lookup (one native crash fixed), DLL built with the static MSVC runtime.
-16. An optional anchor (`elytraRouteAnchorX`, `elytraRouteAnchorZ`) pins the route line so sideways drift corrects itself.
-17. `LookBehavior.hunterbuddyNextRotation()` exposes the next tick's aim to the addon, kept through ProGuard.
-18. Every wall, ceiling and floor hit is logged with its side, speed and state.
-19. The rescue holds the heading it picked for up to 20 ticks instead of picking again every tick.
-20. The lava escape holds its heading the same way.
-21. Every heading jump over 60 degrees in one tick is logged with what decided it and the distance to the aimed point.
-22. The lava escape never pitches down, since the simulation sees lava as air.
-23. When the aimed point is under 4 blocks away, the last heading is held for up to 10 ticks, without rockets, if it stays clear for 5 ticks.
-24. A chunk can no longer be freed while a raytrace reads it: raytraces share a lock that the cache cull, chunk replacement and context free take exclusively (a second native crash).
-25. A flight that circles one spot while path searches keep failing sets down and walks on towards the goal (`elytraCirclingSeconds`).
-26. Rockets are held, and the walk stops off the ground, while the addon eats at emergency health (`elytraHoldFireworks`).
-27. Every collision log says how much of the trajectory the pathfinder cache already knew.
-28. The lava walk-out looks for a shore up to 24 blocks away, across lava, as long as there is a floor the whole way.
-29. A failing segment re-paths from the player on the ground as well as in the air, at most once every 40 ticks, instead of retrying the same buried resume point for ever.
-30. The takeoff spends at most one rung every two seconds, and runs the whole ladder three times before giving up.
-31. The stay in lava survives a lost control, so the walk-out after `elytraLavaWalkOutSeconds` is reachable instead of restarting from zero every two ticks.
-32. A pillar that would jump into a solid block three up breaks it first, instead of jumping into it and failing over and over.
-33. When launch, climb and relocate have all failed, the ladder tries digging three blocks straight up before giving up on the takeoff entirely.
-34. A movement that runs past its expected time logs what it was standing in, what was above it, whether it was on the ground, and what was in hand.
+16. `LookBehavior.hunterbuddyNextRotation()` exposes the next tick's aim to the addon, kept through ProGuard.
+17. Every wall, ceiling and floor hit is logged with its side, speed and state.
+18. The rescue holds the heading it picked for up to 20 ticks instead of picking again every tick.
+19. The lava escape holds its heading the same way.
+20. Every heading jump over 60 degrees in one tick is logged with what decided it and the distance to the aimed point.
+21. The lava escape never pitches down, since the simulation sees lava as air.
+22. When the aimed point is under 4 blocks away, the last heading is held for up to 10 ticks, without rockets, if it stays clear for 5 ticks.
+23. A chunk can no longer be freed while a raytrace reads it: raytraces share a lock that the cache cull, chunk replacement and context free take exclusively (a second native crash).
+24. A flight that circles one spot while path searches keep failing sets down and walks on towards the goal (`elytraCirclingSeconds`).
+25. Rockets are held, and the walk stops off the ground, while the addon eats at emergency health (`elytraHoldFireworks`).
+26. Every collision log says how much of the trajectory the pathfinder cache already knew.
+27. The lava walk-out looks for a shore up to 24 blocks away, across lava, as long as there is a floor the whole way.
+28. A failing segment re-paths from the player on the ground as well as in the air, at most once every 40 ticks, instead of retrying the same buried resume point for ever.
+29. The takeoff spends at most one rung every two seconds, and runs the whole ladder three times before giving up.
+30. The stay in lava survives a lost control, so the walk-out after `elytraLavaWalkOutSeconds` is reachable instead of restarting from zero every two ticks.
+31. A pillar that would jump into a solid block three up breaks it first, instead of jumping into it and failing over and over.
+32. When launch, climb and relocate have all failed, the ladder tries digging three blocks straight up before giving up on the takeoff entirely.
+33. A movement that runs past its expected time logs what it was standing in, what was above it, whether it was on the ground, and what was in hand.
+34. A single raytrace that starts or ends outside the native octree's height (0 to 128) is refused instead of reading past the end of the chunk it indexes into, which crashed the game from the solver; batched hitbox checks are untouched, so climbs to the roof still see.
 
 ## Settings added by this fork
 
@@ -61,8 +61,6 @@ Fork of Baritone for **Minecraft 1.21.11 only** (`v1.3.0-1.21.11`, Mojang mappin
 | `elytraFireworkBoostMultiplier` | `1.5` | Firework acceleration the flight simulation assumes |
 | `elytraFireworkExtraBoostTicks` | `0` | Ticks a boost lasts beyond the rocket's own lifetime |
 | `elytraPathLegLength` | `128` | How far ahead a search aims on a long, straight destination, in blocks |
-| `elytraRouteAnchorX` | `Long.MIN_VALUE` | X of a fixed point that, with the destination, pins the leg-aim line (off until Z is also set) |
-| `elytraRouteAnchorZ` | `Long.MIN_VALUE` | Z of that fixed point (off until X is also set) |
 | `elytraLavaWalkOutSeconds` | `10` | Seconds in lava before the takeoff gives up on the elytra and walks out |
 | `obsidianReserve` | `25` | Obsidian never spent by a pillar, a bridge or anything else Baritone places |
 | `elytraCirclingSeconds` | `5` | Seconds circling one spot with failing searches before setting down and walking on |

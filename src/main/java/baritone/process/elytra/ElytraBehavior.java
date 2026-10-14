@@ -507,41 +507,20 @@ public final class ElytraBehavior implements Helper {
                 return null;
             }
             final BetterBlockPos dest = ElytraBehavior.this.destination;
-            final BlockPos aimFrom = routeAnchoredFrom(from, dest);
-            final double dx = dest.x - aimFrom.getX();
-            final double dz = dest.z - aimFrom.getZ();
+            final double dx = dest.x - from.getX();
+            final double dz = dest.z - from.getZ();
             final double distance = Math.sqrt(dx * dx + dz * dz);
             // in chunk-sized steps, out to well past the farthest a client loads; all of that loaded, and it is as if
             // the destination were no further
             for (double along = leg; along + 16 < distance && along <= leg + 1024; along += 16) {
                 // both the sample and the point handed back out of the loaded chunks: the loaded area is made of
                 // whole chunks and fills in unevenly at its edge, so one sample out of it does not put the next out
-                final BetterBlockPos end = pointAlong(aimFrom, dest, (along + 16) / distance);
-                if (!ctx.world().isLoaded(pointAlong(aimFrom, dest, along / distance)) && !ctx.world().isLoaded(end)) {
+                final BetterBlockPos end = pointAlong(from, dest, (along + 16) / distance);
+                if (!ctx.world().isLoaded(pointAlong(from, dest, along / distance)) && !ctx.world().isLoaded(end)) {
                     return end;
                 }
             }
             return null;
-        }
-
-        private static BlockPos routeAnchoredFrom(final BlockPos from, final BetterBlockPos dest) {
-            final long anchorX = Baritone.settings().elytraRouteAnchorX.value;
-            final long anchorZ = Baritone.settings().elytraRouteAnchorZ.value;
-            if (anchorX == Long.MIN_VALUE || anchorZ == Long.MIN_VALUE) {
-                return from;
-            }
-            final double lineX = dest.x - anchorX;
-            final double lineZ = dest.z - anchorZ;
-            final double lengthSq = lineX * lineX + lineZ * lineZ;
-            if (lengthSq == 0) {
-                return from;
-            }
-            final double t = Mth.clamp(((from.getX() - anchorX) * lineX + (from.getZ() - anchorZ) * lineZ) / lengthSq, 0.0, 1.0);
-            return new BlockPos(
-                    (int) Math.round(anchorX + t * lineX),
-                    from.getY(),
-                    (int) Math.round(anchorZ + t * lineZ)
-            );
         }
 
         /** The point {@code fraction} of the way from {@code from} to {@code dest}, at a height the native search accepts. */
