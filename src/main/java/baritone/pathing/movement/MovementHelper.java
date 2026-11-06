@@ -32,6 +32,7 @@ import baritone.utils.ToolSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Holder;
+import net.minecraft.util.Mth;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.enchantment.Enchantment;
 import net.minecraft.world.item.enchantment.Enchantments;
@@ -49,8 +50,12 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Optional;
 
+import static baritone.api.utils.RotationUtils.DEG_TO_RAD_F;
 import static baritone.pathing.movement.Movement.HORIZONTALS_BUT_ALSO_DOWN_____SO_EVERY_DIRECTION_EXCEPT_UP;
 import static baritone.pathing.precompute.Ternary.*;
 
@@ -138,7 +143,7 @@ public interface MovementHelper extends ActionCosts, Helper {
         if (block instanceof AirBlock) {
             return YES;
         }
-        if (block instanceof BaseFireBlock || block == Blocks.TRIPWIRE || block == Blocks.COBWEB || block == Blocks.END_PORTAL || block == Blocks.COCOA || block instanceof AbstractSkullBlock || block == Blocks.BUBBLE_COLUMN || block instanceof ShulkerBoxBlock || block instanceof SlabBlock || block instanceof TrapDoorBlock || block == Blocks.HONEY_BLOCK || block == Blocks.END_ROD || block == Blocks.SWEET_BERRY_BUSH || block == Blocks.POINTED_DRIPSTONE || block instanceof AmethystClusterBlock || block instanceof AzaleaBlock) {
+        if (block instanceof BaseFireBlock || block == Blocks.COBWEB || block == Blocks.END_PORTAL || block == Blocks.COCOA || block instanceof AbstractSkullBlock || block == Blocks.BUBBLE_COLUMN || block instanceof ShulkerBoxBlock || block instanceof SlabBlock || block instanceof TrapDoorBlock || block == Blocks.HONEY_BLOCK || block == Blocks.END_ROD || block == Blocks.SWEET_BERRY_BUSH || block == Blocks.POINTED_DRIPSTONE || block instanceof AmethystClusterBlock || block instanceof AzaleaBlock) {
             return NO;
         }
         if (block == Blocks.BIG_DRIPLEAF) {
@@ -324,11 +329,6 @@ public interface MovementHelper extends ActionCosts, Helper {
         return state.canBeReplaced();
     }
 
-    @Deprecated
-    static boolean isReplacable(int x, int y, int z, BlockState state, BlockStateInterface bsi) {
-        return isReplaceable(x, y, z, state, bsi);
-    }
-
     static boolean isDoorPassable(IPlayerContext ctx, BlockPos doorPos, BlockPos playerPos) {
         if (playerPos.equals(doorPos)) {
             return false;
@@ -378,7 +378,7 @@ public interface MovementHelper extends ActionCosts, Helper {
     static boolean avoidWalkingInto(BlockState state) {
         Block block = state.getBlock();
         return !state.getFluidState().isEmpty()
-                || block == Blocks.MAGMA_BLOCK
+                || (block == Blocks.MAGMA_BLOCK && !Baritone.settings().allowWalkOnMagmaBlocks.value)
                 || block == Blocks.CACTUS
                 || block == Blocks.SWEET_BERRY_BUSH
                 || block instanceof BaseFireBlock
@@ -414,13 +414,13 @@ public interface MovementHelper extends ActionCosts, Helper {
 
     static Ternary canWalkOnBlockState(BlockState state) {
         Block block = state.getBlock();
-        if (isBlockNormalCube(state) && block != Blocks.MAGMA_BLOCK && block != Blocks.BUBBLE_COLUMN && block != Blocks.HONEY_BLOCK) {
+        if (isBlockNormalCube(state) && (block != Blocks.MAGMA_BLOCK || Baritone.settings().allowWalkOnMagmaBlocks.value) && block != Blocks.BUBBLE_COLUMN && block != Blocks.HONEY_BLOCK) {
             return YES;
         }
         if (block instanceof AzaleaBlock) {
             return YES;
         }
-        if (block == Blocks.LADDER || (block == Blocks.VINE && Baritone.settings().allowVines.value)) { // TODO reconsider this
+        if (block == Blocks.LADDER || (isClimbable(block) && Baritone.settings().allowVines.value)) { // TODO reconsider this
             return YES;
         }
         if (block == Blocks.FARMLAND || block == Blocks.DIRT_PATH || block == Blocks.SOUL_SAND) {
@@ -534,7 +534,7 @@ public interface MovementHelper extends ActionCosts, Helper {
      */
     static boolean mustBeSolidToWalkOn(CalculationContext context, int x, int y, int z, BlockState state) {
         Block block = state.getBlock();
-        if (block == Blocks.LADDER || block == Blocks.VINE) {
+        if (isClimbable(block)) {
             return false;
         }
         if (!state.getFluidState().isEmpty()) {
@@ -591,6 +591,20 @@ public interface MovementHelper extends ActionCosts, Helper {
         // (thats how this check is used)
         // therefore dont include weird things that we technically could place against (like carpet) but practically can't
         return isBlockNormalCube(state) || state.getBlock() == Blocks.GLASS || state.getBlock() instanceof StainedGlassBlock;
+    }
+
+    /**
+     * Can we climb up this block by pressing space while inside it?
+     * Also doubles as "If I start a movement on this, can weird things happen?"
+     * because movements can end/start on these blocks despite them not being canWalkOn.
+     */
+    static boolean isClimbable(Block block) {
+        return block == Blocks.LADDER
+            || block == Blocks.VINE
+            || block == Blocks.WEEPING_VINES
+            || block == Blocks.WEEPING_VINES_PLANT
+            || block == Blocks.TWISTING_VINES
+            || block == Blocks.TWISTING_VINES_PLANT;
     }
 
     static double getMiningDurationTicks(CalculationContext context, int x, int y, int z, boolean includeFalling) {
@@ -663,6 +677,43 @@ public interface MovementHelper extends ActionCosts, Helper {
                         ctx.playerRotations()).withPitch(ctx.playerRotations().getPitch()),
                 false
         )).setInput(Input.MOVE_FORWARD, true);
+    }
+
+    static void moveTowardsWithoutRotation(IPlayerContext ctx, MovementState state, float idealYaw) {
+        MovementOption.getOptions(
+                Mth.sin(ctx.playerRotations().getYaw() * DEG_TO_RAD_F),
+                Mth.cos(ctx.playerRotations().getYaw() * DEG_TO_RAD_F),
+                Baritone.settings().allowSprint.value
+        ).min(Comparator.comparing(option -> option.distanceToSq(
+                Mth.sin(idealYaw * DEG_TO_RAD_F),
+                Mth.cos(idealYaw * DEG_TO_RAD_F)
+        ))).ifPresent(selection -> selection.setInputs(state));
+    }
+
+    static void moveTowardsWithoutRotation(IPlayerContext ctx, MovementState state, BlockPos dest) {
+        float idealYaw = RotationUtils.calcRotationFromVec3d(
+                ctx.playerHead(),
+                VecUtils.getBlockPosCenter(dest),
+                ctx.playerRotations()
+        ).getYaw();
+        moveTowardsWithoutRotation(ctx, state, idealYaw);
+    }
+
+    static void moveTowardsWithSlightRotation(IPlayerContext ctx, MovementState state, BlockPos dest) {
+        float idealYaw = RotationUtils.calcRotationFromVec3d(
+                ctx.playerHead(),
+                VecUtils.getBlockPosCenter(dest),
+                ctx.playerRotations()
+        ).getYaw();
+        float distance = Rotation.yawDistanceFromOffset(ctx.playerRotations().getYaw(), idealYaw) % 45f;
+        float newYaw = distance > 0f ?
+                distance > 22.5f ? distance - 45f : distance :
+                distance < -22.5f ? distance + 45f : distance;
+        state.setTarget(new MovementTarget(new Rotation(
+                ctx.playerRotations().getYaw() - newYaw,
+                ctx.playerRotations().getPitch()
+        ), true));
+        moveTowardsWithoutRotation(ctx, state, idealYaw);
     }
 
     /**
@@ -784,7 +835,7 @@ public interface MovementHelper extends ActionCosts, Helper {
         if (ctx.getSelectedBlock().isPresent()) {
             BlockPos selectedBlock = ctx.getSelectedBlock().get();
             Direction side = ((BlockHitResult) ctx.objectMouseOver()).getDirection();
-            // only way for selectedBlock.equals(placeAt) to be true is if it's replacable
+            // only way for selectedBlock.equals(placeAt) to be true is if it's replaceable
             if (selectedBlock.equals(placeAt) || (MovementHelper.canPlaceAgainst(ctx, selectedBlock) && selectedBlock.relative(side).equals(placeAt))) {
                 if (wouldSneak) {
                     state.setInput(Input.SNEAK, true);
@@ -812,5 +863,17 @@ public interface MovementHelper extends ActionCosts, Helper {
         return b instanceof AirBlock ||
                 b == Blocks.LAVA ||
                 b == Blocks.WATER;
+    }
+
+    static List<BetterBlockPos> steppingOnBlocks(IPlayerContext ctx) {
+        List<BetterBlockPos> blocks = new ArrayList<>();
+        for (byte x = -1; x <= 1; x++) {
+            for (byte z = -1; z <= 1; z++) {
+                if (ctx.player().getBoundingBox().intersects(Vec3.atLowerCornerOf(ctx.player().blockPosition()).add(x, 0, z), Vec3.atLowerCornerOf(ctx.player().blockPosition()).add(x + 1, 1, z + 1))) {
+                    blocks.add(new BetterBlockPos(ctx.player().getBlockX() + x, ctx.player().getBlockY() - 1, ctx.player().getBlockZ() + z));
+                }
+            }
+        }
+        return blocks;
     }
 }

@@ -112,7 +112,7 @@ public class MovementAscend extends Movement {
             // and in that scenario, when we arrive and break srcUp2, that lets srcUp3 fall on us and suffocate us
         }
         BlockState srcDown = context.get(x, y - 1, z);
-        if (srcDown.getBlock() == Blocks.LADDER || srcDown.getBlock() == Blocks.VINE) {
+        if (MovementHelper.isClimbable(srcDown.getBlock())) {
             return COST_INF;
         }
         // we can jump from soul sand, but not from a bottom slab
@@ -131,8 +131,10 @@ public class MovementAscend extends Movement {
             }
         } else {
             // jumpingFromBottomSlab must be false
-            if (toPlace.getBlock() == Blocks.SOUL_SAND) {
+            if (toPlace.is(Blocks.SOUL_SAND)) {
                 walk = WALK_ONE_OVER_SOUL_SAND_COST;
+            } else if (toPlace.is(Blocks.MAGMA_BLOCK)) {
+                walk = SNEAK_ONE_BLOCK_COST;
             } else {
                 walk = Math.max(JUMP_ONE_BLOCK_COST, WALK_ONE_BLOCK_COST);
             }
@@ -188,6 +190,9 @@ public class MovementAscend extends Movement {
             return state;
         }
         MovementHelper.moveTowards(ctx, state, dest);
+
+        state.setInput(Input.SNEAK, Baritone.settings().allowWalkOnMagmaBlocks.value && jumpingOnto.is(Blocks.MAGMA_BLOCK));
+
         if (MovementHelper.isBottomSlab(jumpingOnto) && !MovementHelper.isBottomSlab(BlockStateInterface.get(ctx, src.below()))) {
             return state; // don't jump while walking from a non double slab into a bottom slab
         }

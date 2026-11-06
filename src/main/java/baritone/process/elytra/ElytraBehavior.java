@@ -55,6 +55,7 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.Fireworks;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.AirBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkSource;
@@ -87,11 +88,12 @@ public final class ElytraBehavior implements Helper {
     private List<BetterBlockPos> visiblePath;
 
     // :sunglasses:
-    public final NetherPathfinderContext context;
+    public final NetherPathfinderContext npfContext;
+    public final IElytraPathFinder pathFinder;
     /**
-     * A second native context mirroring {@link #context}, except every chunk outside the corridor pushed via
+     * A second native context mirroring {@link #npfContext}, except every chunk outside the corridor pushed via
      * {@link ElytraProcess#setPathCorridor} is inserted as solid, so a search in it cannot leave the corridor.
-     * Only the path search uses it; raytraces and {@link #passable} stay on {@link #context}.
+     * Only the path search uses it; raytraces and {@link #passable} stay on {@link #npfContext}.
      */
     final NetherPathfinderContext corridorContext;
     /** Chunks currently masked solid in {@link #corridorContext} for being outside the corridor. Game thread only. */
@@ -173,7 +175,6 @@ public final class ElytraBehavior implements Helper {
     private String lastCollisionLine;
 
     private BlockStateInterface bsi;
-    private final BlockStateOctreeInterface boi;
     public final BetterBlockPos destination;
     private final boolean appendDestination;
 
@@ -188,7 +189,7 @@ public final class ElytraBehavior implements Helper {
     private int invTickCountdown = 0;
     private final Queue<Runnable> invTransactionQueue = new LinkedList<>();
 
-    public ElytraBehavior(Baritone baritone, ElytraProcess process, BlockPos destination, boolean appendDestination) {
+    public ElytraBehavior(Baritone baritone, ElytraProcess process, NetherPathfinderContext npf, BlockPos destination, boolean appendDestination) {
         this.baritone = baritone;
         this.ctx = baritone.getPlayerContext();
         this.clearLines = new CopyOnWriteArrayList<>();
@@ -199,13 +200,20 @@ public final class ElytraBehavior implements Helper {
         this.appendDestination = appendDestination;
         this.solverExecutor = Executors.newSingleThreadExecutor();
 
-        this.context = new NetherPathfinderContext(Baritone.settings().elytraNetherSeed.value);
-        this.boi = new BlockStateOctreeInterface(context);
+        this.npfContext = npf;
         // Same seed as the main context: with elytraPredictTerrain on, a chunk the client has not received is
         // generated from it, and the two contexts must not disagree about what is there.
         this.corridorContext = process.hasCorridor() && Baritone.settings().elytraCorridor.value
-                ? new NetherPathfinderContext(Baritone.settings().elytraNetherSeed.value)
+                ? new NetherPathfinderContext(npf.getSeed(), null, ctx.world())
                 : null;
+
+        if (ctx.world().dimension() == Level.NETHER) {
+            this.pathFinder = Baritone.settings().elytraAllowAboveRoof.value && Baritone.settings().elytraAllowAboveBuildLimit.value
+                    ? new BuildLimitPathFinder(ctx, npfContext)
+                    : npfContext;
+        } else {
+            this.pathFinder = Baritone.settings().elytraAllowAboveBuildLimit.value ? new BuildLimitPathFinder(ctx, npfContext) : npfContext;
+        }
     }
 
     public final class PathManager {
@@ -242,9 +250,18 @@ public final class ElytraBehavior implements Helper {
                 this.ticksNearUnchanged = 0;
             }
 
-            // Obstacles are more important than an incomplete path, handle those first.
-            this.pathfindAroundObstacles();
+            int minY = ctx.world().dimensionType().minY();
+            int y = ctx.playerFeet().y;
+
+            npfContext.acquireReadLock();
+            try {
+                // Obstacles are more important than an incomplete path, handle those first.
+                this.pathfindAroundObstacles();
+            } finally {
+                npfContext.releaseReadLock();
+            }
             this.attemptNextSegment();
+
         }
 
         public CompletableFuture<Void> pathToDestination() {
@@ -298,7 +315,7 @@ public final class ElytraBehavior implements Helper {
                 return segment.append(after.stream(), complete);
             };
             return (upToIncl.isPresent()
-                    ? this.path0(from, this.path.get(upToIncl.getAsInt()), rejoin)
+                    ? this.path0(from, fixDestination(this.path.get(upToIncl.getAsInt())), rejoin)
                     : this.pathOnwards(from, rejoin))
                     .whenComplete((result, ex) -> {
                         this.recalculating = false;
@@ -330,7 +347,7 @@ public final class ElytraBehavior implements Helper {
             this.pathOnwards(pathStart, segment -> segment.prepend(before.stream()))
                     .thenRun(() -> {
                         final int recompute = this.path.size() - before.size() - 1;
-                        final double distance = this.path.get(0).distanceTo(this.path.get(recompute));
+                        final double distance = recompute > 0 ? this.path.get(0).distanceTo(this.path.get(recompute)) : 0;
 
                         if (this.completePath) {
                             logVerbose(String.format("Computed path (%.1f blocks in %.4f seconds)", distance, (System.nanoTime() - start) / 1e9d));
@@ -402,13 +419,13 @@ public final class ElytraBehavior implements Helper {
         private void setPath(final UnpackedSegment segment) {
             List<BetterBlockPos> path = segment.collect();
             if (ElytraBehavior.this.appendDestination) {
-                BlockPos dest = ElytraBehavior.this.destination;
+                BlockPos dest = destinationFixed();
                 BlockPos last = !path.isEmpty() ? path.get(path.size() - 1) : null;
                 if (last != null && ElytraBehavior.this.clearView(Vec3.atLowerCornerOf(dest), Vec3.atLowerCornerOf(last), false)) {
                     path.add(new BetterBlockPos(dest));
                 } else {
-                    logDirect("unable to land at " + ElytraBehavior.this.destination);
-                    process.landingSpotIsBad(new BetterBlockPos(ElytraBehavior.this.destination));
+                    logDirect("unable to land at " + dest);
+                    process.landingSpotIsBad(new BetterBlockPos(dest));
                 }
             }
             this.path = new NetherPath(path);
@@ -470,8 +487,9 @@ public final class ElytraBehavior implements Helper {
 
         // mickey resigned
         private CompletableFuture<Void> path0(BlockPos src, BlockPos dst, UnaryOperator<UnpackedSegment> operator) {
-            return this.search(src, dst)
-                    .thenApply(UnpackedSegment::from)
+            return (ElytraBehavior.this.pathFinder == ElytraBehavior.this.npfContext
+                    ? this.search(src, dst).thenApply(UnpackedSegment::from)
+                    : ElytraBehavior.this.pathFinder.pathFindAsync(src, dst))
                     .thenApply(operator)
                     .thenAcceptAsync(this::setPath, ctx.minecraft()::execute);
         }
@@ -484,7 +502,7 @@ public final class ElytraBehavior implements Helper {
         private CompletableFuture<Void> pathOnwards(BlockPos src, UnaryOperator<UnpackedSegment> operator) {
             final BetterBlockPos leg = this.legTarget(src);
             if (leg == null) {
-                return this.path0(src, ElytraBehavior.this.destination, operator);
+                return this.path0(src, destinationFixed(), operator);
             }
             return this.path0(src, leg, segment -> operator.apply(segment.unfinished()));
         }
@@ -503,10 +521,10 @@ public final class ElytraBehavior implements Helper {
             final int leg = Baritone.settings().elytraPathLegLength.value;
             final boolean corridor = ElytraBehavior.this.corridorContext != null && process.hasCorridor()
                     && Baritone.settings().elytraCorridor.value;
-            if (leg <= 0 || ElytraBehavior.this.appendDestination || corridor) {
+            if (leg <= 0 || ElytraBehavior.this.appendDestination || corridor || ElytraBehavior.this.pathFinder != ElytraBehavior.this.npfContext) {
                 return null;
             }
-            final BetterBlockPos dest = ElytraBehavior.this.destination;
+            final BetterBlockPos dest = destinationFixed();
             final double dx = dest.x - from.getX();
             final double dz = dest.z - from.getZ();
             final double distance = Math.sqrt(dx * dx + dz * dz);
@@ -524,10 +542,10 @@ public final class ElytraBehavior implements Helper {
         }
 
         /** The point {@code fraction} of the way from {@code from} to {@code dest}, at a height the native search accepts. */
-        private static BetterBlockPos pointAlong(final BlockPos from, final BetterBlockPos dest, final double fraction) {
+        private BetterBlockPos pointAlong(final BlockPos from, final BetterBlockPos dest, final double fraction) {
             return new BetterBlockPos(
                     from.getX() + (int) Math.round((dest.x - from.getX()) * fraction),
-                    Mth.clamp(from.getY() + (int) Math.round((dest.y - from.getY()) * fraction), 0, 127),
+                    Mth.clamp(from.getY() + (int) Math.round((dest.y - from.getY()) * fraction), ctx.world().getMinY(), ctx.world().getMinY() + ElytraBehavior.this.npfContext.getMaxHeight() - 1),
                     from.getZ() + (int) Math.round((dest.z - from.getZ()) * fraction)
             );
         }
@@ -539,11 +557,11 @@ public final class ElytraBehavior implements Helper {
          * failure does: as a {@link CompletionException} wrapping a {@link PathCalculationException}.
          */
         private CompletableFuture<PathSegment> search(final BlockPos src, final BlockPos dst) {
-            final boolean x4 = Baritone.settings().elytraPathNodeSize.value >= 4;
+            final boolean x4 = Baritone.settings().elytraPathNodeSize.value >= 4 && !Baritone.settings().elytraAllowTightSpaces.value;
             final boolean adaptive = Baritone.settings().elytraPathNodeAdaptive.value;
             final NetherPathfinderContext corridor = ElytraBehavior.this.corridorContext;
             if (corridor == null || !process.hasCorridor() || !Baritone.settings().elytraCorridor.value) {
-                return this.searchIn(ElytraBehavior.this.context, "full map", src, dst, x4, adaptive);
+                return this.searchIn(ElytraBehavior.this.npfContext, "full map", src, dst, x4, adaptive);
             }
             ElytraBehavior.this.corridorAdmit(src);
             // handle() sees both outcomes of the corridor search and nothing else. An exceptionallyCompose chained
@@ -560,7 +578,7 @@ public final class ElytraBehavior implements Helper {
                         logVerbose("corridor: no path ("
                                 + (ex == null ? "stub, " + segment.packed.length + " nodes" : cause.getMessage())
                                 + "), falling back to the full map");
-                        return this.searchIn(ElytraBehavior.this.context, "full map", src, dst, x4, adaptive);
+                        return this.searchIn(ElytraBehavior.this.npfContext, "full map", src, dst, x4, adaptive);
                     })
                     .thenCompose(Function.identity());
         }
@@ -697,6 +715,7 @@ public final class ElytraBehavior implements Helper {
             return ex;
         }
 
+        // required read lock to be held
         private void pathfindAroundObstacles() {
             if (this.recalculating) {
                 return;
@@ -727,7 +746,7 @@ public final class ElytraBehavior implements Helper {
 
             int rangeStartIncl = playerNear;
             int rangeEndExcl = playerNear;
-            while (rangeEndExcl < path.size() && context.hasChunk(new ChunkPos(path.get(rangeEndExcl)))) {
+            while (rangeEndExcl < path.size() && npfContext.hasChunk(new ChunkPos(path.get(rangeEndExcl)))) {
                 rangeEndExcl++;
             }
             // rangeEndExcl now represents an index either not in the path, or just outside render distance
@@ -749,7 +768,7 @@ public final class ElytraBehavior implements Helper {
                 while (rejoin > rangeStartIncl && !ElytraBehavior.this.passable(path.get(rejoin).x, path.get(rejoin).y, path.get(rejoin).z, false)) {
                     rejoin--;
                 }
-                final BetterBlockPos wallDest = ElytraBehavior.this.destination;
+                final BetterBlockPos wallDest = destinationFixed();
                 final OptionalInt rejoinAt = rejoin > rangeStartIncl && path.get(rejoin).distanceSq(wallDest) < feet.distanceSq(wallDest)
                         ? OptionalInt.of(rejoin)
                         : OptionalInt.empty();
@@ -776,7 +795,8 @@ public final class ElytraBehavior implements Helper {
                     // obstacle. where do we return to pathing?
                     // if the end of render distance is closer to goal, then that's fine, otherwise we'd be "digging our hole deeper" and making an already bad backtrack worse
                     OptionalInt rejoinMainPathAt;
-                    if (this.path.get(rangeEndExcl - 1).distanceSq(ElytraBehavior.this.destination) < ctx.playerFeet().distanceSq(ElytraBehavior.this.destination)) {
+                    var dest = destinationFixed();
+                    if (this.path.get(rangeEndExcl - 1).distanceSq(dest) < ctx.playerFeet().distanceSq(dest)) {
                         rejoinMainPathAt = OptionalInt.of(rangeEndExcl - 1); // rejoin after current render distance
                     } else {
                         rejoinMainPathAt = OptionalInt.empty(); // large backtrack detected. ignore render distance, rejoin later on
@@ -816,7 +836,7 @@ public final class ElytraBehavior implements Helper {
                 BetterBlockPos p = this.failedSegmentStart;
                 logVerbose(String.format(
                         "Segment failure diagnostics: hasChunk=%b passable=%b",
-                        ElytraBehavior.this.context.hasChunk(new ChunkPos(p)),
+                        ElytraBehavior.this.npfContext.hasChunk(new ChunkPos(p)),
                         ElytraBehavior.this.passable(p.x, p.y, p.z, false)
                 ));
             }
@@ -839,7 +859,9 @@ public final class ElytraBehavior implements Helper {
                 return;
             }
 
-            if (!this.completePath && ctx.world().isLoaded(this.path.get(last))) {
+            final BetterBlockPos lastPos = this.path.get(last);
+            // `ctx.world().isLoaded` cannot be used here as it returns false is the y-value is beyond the build limits.
+            if (!this.completePath && ctx.world().getChunkSource().hasChunk(lastPos.x >> 4, lastPos.z >> 4)) {
                 this.pathNextSegment(last);
             }
         }
@@ -915,13 +937,13 @@ public final class ElytraBehavior implements Helper {
     }
 
     public void onChunkEvent(ChunkEvent event) {
-        if (event.isPostPopulate() && this.context != null) {
+        if (event.isPostPopulate() && this.npfContext != null) {
             // A chunk packet the client discarded (outside its view range) still raises this event, and the
             // world hands back its shared empty chunk for it. Packing that would record a chunk of pure air as
             // real terrain, and the path would then be routed straight through whatever is actually there.
             final LevelChunk chunk = ctx.world().getChunkSource().getChunk(event.getX(), event.getZ(), false);
             if (chunk != null && !chunk.isEmpty()) {
-                this.context.queueForPacking(chunk);
+                this.npfContext.queueForPacking(chunk);
                 this.feedCorridor(chunk);
             }
         }
@@ -941,7 +963,7 @@ public final class ElytraBehavior implements Helper {
             ctx.minecraft().execute(() -> this.repackNearPlayer(why));
             return;
         }
-        if (ctx.player() == null || ctx.world() == null || this.context == null) {
+        if (ctx.player() == null || ctx.world() == null || this.npfContext == null) {
             return;
         }
         final long now = System.currentTimeMillis();
@@ -958,7 +980,7 @@ public final class ElytraBehavior implements Helper {
             for (int dz = -1; dz <= 1; dz++) {
                 final LevelChunk chunk = chunkSource.getChunk(centerX + dx, centerZ + dz, false);
                 if (chunk != null && !chunk.isEmpty()) {
-                    this.context.queueForPacking(chunk);
+                    this.npfContext.queueForPacking(chunk);
                     this.feedCorridor(chunk);
                     packed++;
                 }
@@ -968,7 +990,7 @@ public final class ElytraBehavior implements Helper {
     }
 
     public void onBlockChange(BlockChangeEvent event) {
-        this.context.queueBlockUpdate(event);
+        this.npfContext.queueBlockUpdate(event);
         // Only for a chunk inside the corridor: a masked chunk is solid on purpose, and applying a block update
         // to it would carve real air into the wall.
         if (this.corridorContext != null && process.corridorContains(event.getChunkPos().toLong())) {
@@ -977,7 +999,7 @@ public final class ElytraBehavior implements Helper {
     }
 
     /**
-     * Mirrors a chunk just packed into {@link #context} into {@link #corridorContext}: real terrain if inside
+     * Mirrors a chunk just packed into {@link #npfContext} into {@link #corridorContext}: real terrain if inside
      * the corridor, solid if not. Called everywhere the main context is given a chunk.
      */
     private void feedCorridor(final LevelChunk chunk) {
@@ -1107,14 +1129,10 @@ public final class ElytraBehavior implements Helper {
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
-        if (this.context.shutdown()) {
-            // Freeing on the game thread orders it behind any path result already queued there, and with
-            // both executors drained nothing else can be inside a native call.
-            ctx.minecraft().execute(this.context::free);
-        }
-        // Otherwise a search is still wedged in native code: freeing under it would be a use-after-free, so
-        // the context is abandoned instead. The leak is bounded to one context per wedged search.
         if (this.corridorContext != null && this.corridorContext.shutdown()) {
+            // Freeing on the game thread orders it behind any path result already queued there, and with
+            // both executors drained nothing else can be inside a native call. Otherwise a search is still
+            // wedged in native code: freeing under it would be a use-after-free, so the context is abandoned.
             ctx.minecraft().execute(this.corridorContext::free);
         }
     }
@@ -1137,7 +1155,7 @@ public final class ElytraBehavior implements Helper {
                 LevelChunk chunk = chunkProvider.getChunk(x, z, false);
 
                 if (chunk != null && !chunk.isEmpty()) {
-                    this.context.queueForPacking(chunk);
+                    this.npfContext.queueForPacking(chunk);
                     this.feedCorridor(chunk);
                 }
             }
@@ -1160,8 +1178,12 @@ public final class ElytraBehavior implements Helper {
                 this.fireworkHoldNote = 0;
             }
         }
-        synchronized (this.context.cullingLock) {
-            this.onTick0();
+        if (npfContext.tryAcquireReadLock()) {
+            try {
+                this.onTick0();
+            } finally {
+                npfContext.releaseReadLock();
+            }
         }
         if (this.corridorContext != null && process.hasCorridor()
                 && ctx.player().chunkPosition().toLong() != this.lastRingCenter) {
@@ -1172,12 +1194,12 @@ public final class ElytraBehavior implements Helper {
             final int chunkX = ctx.player().chunkPosition().x;
             final int chunkZ = ctx.player().chunkPosition().z;
             final int cullDistance = Baritone.settings().elytraCacheCullDistance.value;
-            this.context.queueCacheCulling(chunkX, chunkZ, cullDistance, this.boi);
+            this.npfContext.queueCacheCulling(chunkX, chunkZ, cullDistance);
             if (this.corridorContext != null) {
-                // No octree interface reads the corridor context, hence null. The cull erases masked chunks like
-                // any other, so forget them here with the native side's own distance rule (chunk units, squared),
-                // or the ring mask would never mask a chunk we come back to again.
-                this.corridorContext.queueCacheCulling(chunkX, chunkZ, cullDistance, null);
+                // The cull erases masked chunks like any other, so forget them here with the native side's
+                // own distance rule (chunk units, squared), or the ring mask would never mask a chunk we
+                // come back to again.
+                this.corridorContext.queueCacheCulling(chunkX, chunkZ, cullDistance);
                 final long maxDistSq = (long) (cullDistance / 16) * (cullDistance / 16);
                 final LongIterator it = this.maskedKeys.iterator();
                 while (it.hasNext()) {
@@ -1197,11 +1219,17 @@ public final class ElytraBehavior implements Helper {
         // Fetch the previous solution, regardless of if it's going to be used
         this.pendingSolution = null;
         if (this.solver != null) {
-            try {
-                this.pendingSolution = this.solver.get();
-            } catch (Exception ignored) {
-                // it doesn't matter if get() fails since the solution can just be recalculated synchronously
-            } finally {
+            if (this.solver.isDone()) {
+                try {
+                    this.pendingSolution = this.solver.get();
+                } catch (Exception ignored) {
+                    // it doesn't matter if get() fails since the solution can just be recalculated synchronously
+                } finally {
+                    this.solver = null;
+                }
+            } else {
+                // avoid wasting more cycles on a hard solution, we'll do the work synchronously
+                this.solver.cancel(true);
                 this.solver = null;
             }
         }
@@ -1241,7 +1269,7 @@ public final class ElytraBehavior implements Helper {
         final List<BetterBlockPos> path = this.pathManager.getPath();
         if (path.isEmpty()) {
             return;
-        } else if (this.destination == null) {
+        } else if (this.destination == null) { // null check why????
             this.pathManager.clear();
             return;
         }
@@ -1263,7 +1291,6 @@ public final class ElytraBehavior implements Helper {
         if (this.pathManager.getPath().isEmpty() && !inLava) {
             return;
         }
-
         trySwapElytra();
 
         if (ctx.player().horizontalCollision) {
@@ -1286,10 +1313,10 @@ public final class ElytraBehavior implements Helper {
 
         // If there's no previously calculated solution to use, or the context used at the end of last tick doesn't match this tick
         final Solution solution;
-        if (this.pendingSolution == null || !this.pendingSolution.context.equals(solverContext)) {
-            solution = this.solveAngles(solverContext);
-        } else {
+        if (this.pendingSolution != null && this.pendingSolution.context.equals(solverContext)) {
             solution = this.pendingSolution;
+        } else {
+            solution = this.solveAngles(solverContext);
         }
 
         if (inLava) {
@@ -1410,11 +1437,19 @@ public final class ElytraBehavior implements Helper {
             this.pathManager.updatePlayerNear();
 
             final SolverContext context = this.new SolverContext(true);
-            this.solver = this.solverExecutor.submit(() -> this.solveAngles(context));
+            this.solver = this.solverExecutor.submit(() -> {
+                npfContext.acquireReadLock();
+                try {
+                    return this.solveAngles(context);
+                } finally {
+                    npfContext.releaseReadLock();
+                }
+            });
             this.solveNextTick = false;
         }
     }
 
+    // calls passable which requires a read lock
     private Solution solveAngles(final SolverContext context) {
         if (context.ignoreLava) {
             return this.solveLavaEscape(context);
@@ -1434,6 +1469,7 @@ public final class ElytraBehavior implements Helper {
             int minStep = playerNear;
 
             for (int i = Math.min(playerNear + scanAhead, path.size() - 1); i >= minStep; i--) {
+                if (Thread.interrupted()) return null; // cancelled by the game thread
                 final List<Pair<Vec3, Integer>> candidates = new ArrayList<>();
                 for (int dy : heights) {
                     if (relaxation == 0 || i == minStep) {
@@ -1793,8 +1829,11 @@ public final class ElytraBehavior implements Helper {
      */
     public boolean nativeSolid(int x, int y, int z) {
         // the cache cull frees chunks under this lock, and the reader caches a pointer to the last one it read
-        synchronized (this.context.cullingLock) {
+        this.npfContext.acquireReadLock();
+        try {
             return !this.passable(x, y, z, false);
+        } finally {
+            this.npfContext.releaseReadLock();
         }
     }
 
@@ -2105,14 +2144,15 @@ public final class ElytraBehavior implements Helper {
             return clear;
         }
 
-        return this.context.raytrace(8, src, dst, NetherPathfinderContext.Visibility.ALL);
+
+        return raytrace(8, src, dst, NetherPathfinderContext.Visibility.ALL);
     }
 
     public boolean clearView(Vec3 start, Vec3 dest, boolean ignoreLava) {
         final boolean clear;
         if (!ignoreLava) {
             // if start == dest then the cpp raytracer dies
-            clear = start.equals(dest) || this.context.raytrace(start, dest);
+            clear = start.equals(dest) || raytrace(start, dest);
         } else {
             clear = ctx.world().clip(new ClipContext(start, dest, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, ctx.player())).getType() == HitResult.Type.MISS;
         }
@@ -2383,12 +2423,13 @@ public final class ElytraBehavior implements Helper {
         return new Vec3(motionX, motionY, motionZ);
     }
 
+    // any call to this must be done with the lock held
     private boolean passable(int x, int y, int z, boolean ignoreLava) {
         if (ignoreLava) {
             final BlockState state = this.bsi.get0(x, y, z);
             return state.getBlock() instanceof AirBlock || MovementHelper.isLava(state);
         } else {
-            return !this.boi.get0(x, y, z);
+            return passable(x, y, z);
         }
     }
 
@@ -2520,5 +2561,81 @@ public final class ElytraBehavior implements Helper {
         return a.minX < b.maxX && a.maxX > b.minX
                 && a.minY < b.maxY && a.maxY > b.minY
                 && a.minZ < b.maxZ && a.maxZ > b.minZ;
+    }
+
+    // so we don't get stuck trying to pathfind through the roof
+    private BetterBlockPos fixDestination(BetterBlockPos dst) {
+        if (ctx.world().dimension() == Level.NETHER) {
+            if (ctx.player().getY() >= 128 && dst.y < 128) {
+                return new BetterBlockPos(dst.x, 128, dst.z);
+            }
+            else if (ctx.player().getY() < 128 && dst.y >= 128) {
+                return new BetterBlockPos(dst.x, 64, dst.z);
+            }
+        }
+        return dst;
+    }
+
+    private BetterBlockPos destinationFixed() {
+        return fixDestination(this.destination);
+    }
+
+    public boolean raytrace(double startX, double startY, double startZ, double endX, double endY, double endZ) {
+        final int maxHeight = npfContext.getMaxHeight() + ctx.world().getMinY();
+        final int minHeight = ctx.world().getMinY();
+        final boolean isOOB = startY >= maxHeight || endY >= maxHeight || startY < minHeight || endY < minHeight;
+        if (isOOB) {
+            Vec3 start = new Vec3(startX, startY, startZ);
+            Vec3 end = new Vec3(endX, endY, endZ);
+            return ctx.world().clip(new ClipContext(start, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, ctx.player())).getType() == HitResult.Type.MISS;
+        }
+
+        return npfContext.raytrace(startX, startY, startZ, endX, endY, endZ);
+    }
+
+    public boolean raytrace(Vec3 start, Vec3 end) {
+        final int maxHeight = npfContext.getMaxHeight() + ctx.world().getMinY();
+        final int minHeight = ctx.world().getMinY();
+        final boolean isOOB = start.y >= maxHeight || end.y >= maxHeight || start.y < minHeight || end.y < minHeight;
+        if (isOOB) {
+            return ctx.world().clip(new ClipContext(start, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, ctx.player())).getType() == HitResult.Type.MISS;
+        }
+        return npfContext.raytrace(start.x, start.y, start.z, end.x, end.y, end.z);
+    }
+
+    public boolean raytrace(int count, double[] src, double[] dst, int visibility) {
+        if (src.length != count * 3 || src.length != dst.length) {
+            throw new IllegalArgumentException("Expected source and dst to have length of " + (count * 3));
+        }
+        final int maxHeight = npfContext.getMaxHeight() + ctx.world().getMinY();
+
+        boolean isOOB = false;
+        for(int i = 1; i < src.length; i += 3) {
+            if (src[i] >= maxHeight || src[i] < ctx.world().getMinY() ||
+                    dst[i] >= maxHeight || dst[i] < ctx.world().getMinY()) {
+                isOOB = true;
+                break;
+            }
+        }
+
+        if(isOOB) {
+            for (int i = 0; i < count; i++) {
+                Vec3 start = new Vec3(src[i * 3], src[i * 3 + 1], src[i * 3 + 2]);
+                Vec3 end = new Vec3(dst[i * 3], dst[i * 3 + 1], dst[i * 3 + 2]);
+                if (ctx.world().clip(new ClipContext(start, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, ctx.player())).getType() != HitResult.Type.MISS) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        return npfContext.raytrace(count, src, dst, visibility);
+    }
+
+    public boolean passable(int x, int y, int z) {
+        if(y >= ctx.world().getMaxY() || y < ctx.world().getMinY()) {
+            return true;
+        }
+        return npfContext.passable(x, y, z);
     }
 }

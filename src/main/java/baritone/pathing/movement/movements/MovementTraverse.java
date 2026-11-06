@@ -85,6 +85,7 @@ public class MovementTraverse extends Movement {
         if (frostWalker || MovementHelper.canWalkOn(context, destX, y - 1, destZ, destOn)) { //this is a walk, not a bridge
             double WC = WALK_ONE_BLOCK_COST;
             boolean water = false;
+            boolean sneaking = false;
             if (MovementHelper.isWater(pb0) || MovementHelper.isWater(pb1)) {
                 WC = context.waterWalkSpeed;
                 water = true;
@@ -98,6 +99,9 @@ public class MovementTraverse extends Movement {
                 }
                 if (srcDownBlock == Blocks.SOUL_SAND) {
                     WC += (WALK_ONE_OVER_SOUL_SAND_COST - WALK_ONE_BLOCK_COST) / 2;
+                } else if (context.allowWalkOnMagmaBlocks && srcDownBlock.equals(Blocks.MAGMA_BLOCK)) {
+                    sneaking = true;
+                    WC += (SNEAK_ONE_BLOCK_COST - WALK_ONE_BLOCK_COST) / 2;
                 }
             }
             double hardness1 = MovementHelper.getMiningDurationTicks(context, destX, y, destZ, pb1, false);
@@ -106,7 +110,7 @@ public class MovementTraverse extends Movement {
             }
             double hardness2 = MovementHelper.getMiningDurationTicks(context, destX, y + 1, destZ, pb0, true); // only include falling on the upper block to break
             if (hardness1 == 0 && hardness2 == 0) {
-                if (!water && context.canSprint) {
+                if (!water && !sneaking && context.canSprint) {
                     // If there's nothing in the way, and this isn't water, and we aren't sneak placing
                     // We can sprint =D
                     // Don't check for soul sand, since we can sprint on that too
@@ -114,13 +118,13 @@ public class MovementTraverse extends Movement {
                 }
                 return WC;
             }
-            if (srcDownBlock == Blocks.LADDER || srcDownBlock == Blocks.VINE) {
+            if (MovementHelper.isClimbable(srcDownBlock)) {
                 hardness1 *= 5;
                 hardness2 *= 5;
             }
             return WC + hardness1 + hardness2;
         } else {//this is a bridge, so we need to place a block
-            if (srcDownBlock == Blocks.LADDER || srcDownBlock == Blocks.VINE) {
+            if (MovementHelper.isClimbable(srcDownBlock)) {
                 return COST_INF;
             }
             if (MovementHelper.isReplaceable(destX, y - 1, destZ, destOn, context.bsi)) {
@@ -213,11 +217,11 @@ public class MovementTraverse extends Movement {
                     .setInput(Input.SPRINT, true);
         }
 
-        //sneak may have been set to true in the PREPPING state while mining an adjacent block
-        state.setInput(Input.SNEAK, false);
-
         Block fd = BlockStateInterface.get(ctx, src.below()).getBlock();
-        boolean ladder = fd == Blocks.LADDER || fd == Blocks.VINE;
+        boolean ladder = MovementHelper.isClimbable(fd);
+
+        //sneak may have been set to true in the PREPPING state while mining an adjacent block, but we still want it to be true if the player is about to go on magma
+        state.setInput(Input.SNEAK, Baritone.settings().allowWalkOnMagmaBlocks.value && MovementHelper.steppingOnBlocks(ctx).stream().anyMatch(block -> ctx.world().getBlockState(block).is(Blocks.MAGMA_BLOCK)));
 
         if (pb0.getBlock() instanceof DoorBlock || pb1.getBlock() instanceof DoorBlock) {
             boolean notPassable = pb0.getBlock() instanceof DoorBlock && !MovementHelper.isDoorPassable(ctx, src, dest) || pb1.getBlock() instanceof DoorBlock && !MovementHelper.isDoorPassable(ctx, dest, src);
@@ -261,7 +265,7 @@ public class MovementTraverse extends Movement {
             }
             Block low = BlockStateInterface.get(ctx, src).getBlock();
             Block high = BlockStateInterface.get(ctx, src.above()).getBlock();
-            if (ctx.player().position().y > src.y + 0.1D && !ctx.player().onGround() && (low == Blocks.VINE || low == Blocks.LADDER || high == Blocks.VINE || high == Blocks.LADDER)) {
+            if (ctx.player().position().y > src.y + 0.1D && !ctx.player().onGround() && (MovementHelper.isClimbable(low) || MovementHelper.isClimbable(high))) {
                 // hitting W could cause us to climb the ladder instead of going forward
                 // wait until we're on the ground
                 return state;
@@ -274,15 +278,10 @@ public class MovementTraverse extends Movement {
             }
 
             BlockState destDown = BlockStateInterface.get(ctx, dest.below());
-            BlockPos against = positionsToBreak[0];
-            if (feet.getY() != dest.getY() && ladder && (destDown.getBlock() == Blocks.VINE || destDown.getBlock() == Blocks.LADDER)) {
-                against = destDown.getBlock() == Blocks.VINE ? MovementPillar.getAgainst(new CalculationContext(baritone), dest.below()) : dest.relative(destDown.getValue(LadderBlock.FACING).getOpposite());
-                if (against == null) {
-                    logDirect("Unable to climb vines. Consider disabling allowVines.");
-                    return state.setStatus(MovementStatus.UNREACHABLE);
-                }
+            if (feet.getY() != dest.getY() && ladder && MovementHelper.isClimbable(destDown.getBlock())) {
+                state.setInput(Input.JUMP, true);
             }
-            MovementHelper.moveTowards(ctx, state, against);
+            MovementHelper.moveTowards(ctx, state, positionsToBreak[0]);
             return state;
         } else {
             wasTheBridgeBlockAlwaysThere = false;
@@ -296,7 +295,7 @@ public class MovementTraverse extends Movement {
                 }
             }
             double dist1 = Math.max(Math.abs(ctx.player().position().x - (dest.getX() + 0.5D)), Math.abs(ctx.player().position().z - (dest.getZ() + 0.5D)));
-            PlaceResult p = MovementHelper.attemptToPlaceABlock(state, baritone, dest.below(), false, true);
+            PlaceResult p = MovementHelper.attemptToPlaceABlock(state, baritone, dest.below(), false, !Baritone.settings().assumeSafeWalk.value);
             if ((p == PlaceResult.READY_TO_PLACE || dist1 < 0.6) && !Baritone.settings().assumeSafeWalk.value) {
                 state.setInput(Input.SNEAK, true);
             }
@@ -352,9 +351,8 @@ public class MovementTraverse extends Movement {
                 }
                 return state;
             }
-            MovementHelper.moveTowards(ctx, state, positionsToBreak[0]);
+            MovementHelper.moveTowardsWithSlightRotation(ctx, state, dest);
             return state;
-            // TODO MovementManager.moveTowardsBlock(to); // move towards not look at because if we are bridging for a couple blocks in a row, it is faster if we dont spin around and walk forwards then spin around and place backwards for every block
         }
     }
 
@@ -370,7 +368,7 @@ public class MovementTraverse extends Movement {
     protected boolean prepared(MovementState state) {
         if (ctx.playerFeet().equals(src) || ctx.playerFeet().equals(src.below())) {
             Block block = BlockStateInterface.getBlock(ctx, src.below());
-            if (block == Blocks.LADDER || block == Blocks.VINE) {
+            if (MovementHelper.isClimbable(block)) {
                 state.setInput(Input.SNEAK, true);
             }
         }

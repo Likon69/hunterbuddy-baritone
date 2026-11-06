@@ -237,9 +237,9 @@ public final class Settings {
     /**
      * Blocks that Baritone will attempt to avoid (Used in avoidance)
      */
-    public final Setting<List<Block>> blocksToAvoid = new Setting<>(new ArrayList<>(
-            // Leave Empty by Default
-    ));
+    public final Setting<List<Block>> blocksToAvoid = new Setting<>(new ArrayList<>(List.of(
+            Blocks.TRIPWIRE
+    )));
 
     /**
      * Blocks that Baritone is not allowed to break
@@ -721,8 +721,7 @@ public final class Settings {
     public final Setting<Boolean> renderGoalIgnoreDepth = new Setting<>(true);
 
     /**
-     * Renders X/Z type Goals with the vanilla beacon beam effect. Combining this with
-     * {@link #renderGoalIgnoreDepth} will cause strange render clipping.
+     * Renders X/Z type Goals as a no-depth beacon beam instead of the full-height goal box.
      */
     public final Setting<Boolean> renderGoalXZBeacon = new Setting<>(false);
 
@@ -985,6 +984,11 @@ public final class Settings {
      * Replant nether wart while farming. This setting only has an effect when replantCrops is also enabled
      */
     public final Setting<Boolean> replantNetherWart = new Setting<>(false);
+
+    /**
+     * When enabled, farming will be restricted to the current selection.
+     */
+    public final Setting<Boolean> farmUsingSelection = new Setting<>(false);
 
     /**
      * Farming will scan for at most this many blocks.
@@ -1731,6 +1735,41 @@ public final class Settings {
      * Verbose chat logging in elytra mode
      */
     public final Setting<Boolean> elytraChatSpam = new Setting<>(false);
+
+    /**
+     * May reduce memory usage by using a custom allocator for pathfinding
+     */
+    public final Setting<Boolean> elytraCustomAllocator = new Setting<>(true);
+
+    /**
+     * Allow the pathfinder to attempt flight in tighter spaces, useful in caves but can be dangerous.
+     */
+    public final Setting<Boolean> elytraAllowTightSpaces = new Setting<>(false);
+
+    /**
+     * Allow the pathfinder to fly above y 128 in the nether.
+     */
+    public final Setting<Boolean> elytraAllowAboveRoof = new Setting<>(false);
+
+    /**
+     * Allow the pathfinder to access the baritone cache to improve pathing
+     */
+    public final Setting<Boolean> elytraUseCache = new Setting<>(true);
+
+    /**
+     * Allow the pathfinder to fly above the build limit in the overworld and end.
+     */
+    public final Setting<Boolean> elytraAllowAboveBuildLimit = new Setting<>(true);
+
+    /**
+     * Minimum distance in blocks of an elytra trip before the pathfinder will try to fly above build limit. (Minimum: 32). Requires {@link #elytraAllowAboveBuildLimit} to be enabled.
+     */
+    public final Setting<Integer> elytraLongDistanceThreshold = new Setting<>(500);
+
+    /**
+     * Sneak when magma blocks are under feet
+     */
+    public final Setting<Boolean> allowWalkOnMagmaBlocks = new Setting<>(false);
 
     /**
      * A map of lowercase setting field names to their respective setting
