@@ -85,7 +85,7 @@ public class ToolSet {
         breakStrengthCache = new ConcurrentHashMap<>();
         this.player = player;
         for (int i = 0; i < 9; i++) {
-            hotbar[i] = player.getInventory().getItem(i);
+            hotbar[i] = player.getInventory().getItem(i).copy();
         }
         this.selectedSlot = player.getInventory().getSelectedSlot();
 

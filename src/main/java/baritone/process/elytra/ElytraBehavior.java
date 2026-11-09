@@ -754,18 +754,19 @@ public final class ElytraBehavior implements Helper {
                 // not loaded yet?
                 return;
             }
+            final BlockStateOctreeInterface boi = ElytraBehavior.this.npfContext.getBoi();
             final BetterBlockPos rangeStart = path.get(rangeStartIncl);
-            if (!ElytraBehavior.this.passable(rangeStart.x, rangeStart.y, rangeStart.z, false)) {
+            if (!ElytraBehavior.this.passable(boi, rangeStart.x, rangeStart.y, rangeStart.z, false)) {
                 // the node closest to us is now inside a block, so the terrain changed since this path was computed
                 final BetterBlockPos feet = ctx.playerFeet();
-                if (!ElytraBehavior.this.passable(feet.x, feet.y, feet.z, false)) {
+                if (!ElytraBehavior.this.passable(boi, feet.x, feet.y, feet.z, false)) {
                     // we're inside a block ourselves, recalculating from here can't succeed. while flying that
                     // means the cache is wrong about where we are, so refresh it
                     repackNearPlayer("the cache has us inside a block");
                     return;
                 }
                 int rejoin = rangeEndExcl - 1;
-                while (rejoin > rangeStartIncl && !ElytraBehavior.this.passable(path.get(rejoin).x, path.get(rejoin).y, path.get(rejoin).z, false)) {
+                while (rejoin > rangeStartIncl && !ElytraBehavior.this.passable(boi, path.get(rejoin).x, path.get(rejoin).y, path.get(rejoin).z, false)) {
                     rejoin--;
                 }
                 final BetterBlockPos wallDest = destinationFixed();
@@ -837,7 +838,7 @@ public final class ElytraBehavior implements Helper {
                 logVerbose(String.format(
                         "Segment failure diagnostics: hasChunk=%b passable=%b",
                         ElytraBehavior.this.npfContext.hasChunk(new ChunkPos(p)),
-                        ElytraBehavior.this.passable(p.x, p.y, p.z, false)
+                        ElytraBehavior.this.passable(ElytraBehavior.this.npfContext.getBoi(), p.x, p.y, p.z, false)
                 ));
             }
 
@@ -1264,7 +1265,7 @@ public final class ElytraBehavior implements Helper {
         // ctx AND context???? :DDD
         // Before the path check: everything the solver simulates goes through passable(), and the lava escape
         // solves without a path
-        this.bsi = new BlockStateInterface(ctx);
+        this.bsi = new BlockStateInterface(ctx, true);
 
         final List<BetterBlockPos> path = this.pathManager.getPath();
         if (path.isEmpty()) {
@@ -1328,7 +1329,7 @@ public final class ElytraBehavior implements Helper {
             return;
         }
 
-        final Solution effective = this.holdNearTurn(solution, inLava);
+        final Solution effective = this.holdNearTurn(solution, solverContext, inLava);
 
         final float turnYaw = effective.rotation.getYaw();
         if (!Float.isNaN(this.lastTurnYaw) && ctx.player().tickCount == this.lastTurnTick + 1) {
@@ -1391,7 +1392,7 @@ public final class ElytraBehavior implements Helper {
         );
     }
 
-    private Solution holdNearTurn(final Solution s, final boolean inLava) {
+    private Solution holdNearTurn(final Solution s, final SolverContext current, final boolean inLava) {
         final boolean eligible = s.solvedPitch && s.goingTo != null && s.source.startsWith("path")
                 && !this.landingMode && !inLava
                 && !Float.isNaN(this.lastTurnYaw) && ctx.player().tickCount == this.lastTurnTick + 1;
@@ -1405,7 +1406,7 @@ public final class ElytraBehavior implements Helper {
                 final int ticks = Math.max(5, Baritone.settings().elytraSimulationTicks.value);
                 final int ticksBoosted = s.context.boost.isBoosted() ? Math.max(1, s.context.boost.getGuaranteedBoostTicks()) : 0;
                 final int ticksBoostDelay = 0;
-                final PitchResult held = this.solveSurvivalPitch(s.context, this.lastTurnYaw, ticks, ticksBoosted, ticksBoostDelay);
+                final PitchResult held = this.solveSurvivalPitch(current, this.lastTurnYaw, ticks, ticksBoosted, ticksBoostDelay);
                 if (held != null && held.steps.size() - 1 >= RESCUE_YAW_MIN_SURVIVAL_TICKS) {
                     final int startedAt = this.nearHoldTicks;
                     this.nearHoldTicks++;
@@ -1418,7 +1419,7 @@ public final class ElytraBehavior implements Helper {
                                 ctx.player().getDeltaMovement().horizontalDistance(), pos.x, pos.y, pos.z));
                     }
                     final Vec3 last = held.steps.get(held.steps.size() - 1);
-                    return new Solution(s.context, new Rotation(this.lastTurnYaw, held.pitch), s.context.start.add(last), true, false, "path hold", s.node);
+                    return new Solution(current, new Rotation(this.lastTurnYaw, held.pitch), current.start.add(last), true, false, "path hold", s.node);
                 }
             }
         }
@@ -1825,13 +1826,13 @@ public final class ElytraBehavior implements Helper {
 
     /**
      * Whether the pathfinder's cache holds this block as solid - not always the same as the client's world.
-     * Game thread only, and only while the solver is not running: the cache reader is not thread-safe.
+     * Game thread only.
      */
     public boolean nativeSolid(int x, int y, int z) {
-        // the cache cull frees chunks under this lock, and the reader caches a pointer to the last one it read
+        // the cache cull frees chunks under this lock, and a reader caches a pointer to the last chunk it read
         this.npfContext.acquireReadLock();
         try {
-            return !this.passable(x, y, z, false);
+            return !this.passable(this.npfContext.getBoi(), x, y, z, false);
         } finally {
             this.npfContext.releaseReadLock();
         }
@@ -1903,6 +1904,7 @@ public final class ElytraBehavior implements Helper {
         public final boolean hasFireworks;
         public final FireworkBoost boost;
         public final IAimProcessor aimProcessor;
+        public final BlockStateOctreeInterface boi;
 
         /**
          * Creates a new SolverContext using the current state of the path, player, and firework boost at the time of
@@ -1945,6 +1947,7 @@ public final class ElytraBehavior implements Helper {
                 aim.advance(1);
             }
             this.aimProcessor = aim;
+            this.boi = ElytraBehavior.this.npfContext.getBoi();
         }
 
         @Override
@@ -2350,7 +2353,7 @@ public final class ElytraBehavior implements Helper {
             for (int x = xmin; x < xmax; x++) {
                 for (int y = ymin; y < ymax; y++) {
                     for (int z = zmin; z < zmax; z++) {
-                        if (!this.passable(x, y, z, context.ignoreLava)) {
+                        if (!this.passable(context.boi, x, y, z, context.ignoreLava)) {
                             // displacement only covers the ticks before the impact
                             return stopOnImpact ? displacement : null;
                         }
@@ -2424,12 +2427,15 @@ public final class ElytraBehavior implements Helper {
     }
 
     // any call to this must be done with the lock held
-    private boolean passable(int x, int y, int z, boolean ignoreLava) {
+    private boolean passable(BlockStateOctreeInterface boi, int x, int y, int z, boolean ignoreLava) {
         if (ignoreLava) {
             final BlockState state = this.bsi.get0(x, y, z);
             return state.getBlock() instanceof AirBlock || MovementHelper.isLava(state);
         } else {
-            return passable(x, y, z);
+            if (y >= ctx.world().getMaxY() || y < ctx.world().getMinY()) {
+                return true;
+            }
+            return !boi.get0(x, y, z);
         }
     }
 
@@ -2630,12 +2636,5 @@ public final class ElytraBehavior implements Helper {
         }
 
         return npfContext.raytrace(count, src, dst, visibility);
-    }
-
-    public boolean passable(int x, int y, int z) {
-        if(y >= ctx.world().getMaxY() || y < ctx.world().getMinY()) {
-            return true;
-        }
-        return npfContext.passable(x, y, z);
     }
 }

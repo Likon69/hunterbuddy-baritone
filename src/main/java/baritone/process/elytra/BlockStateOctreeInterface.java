@@ -29,7 +29,7 @@ public final class BlockStateOctreeInterface {
     private final NetherPathfinderContext context;
     private final long contextPtr;
     private final int minY;
-    transient long chunkPtr;
+    private long chunkPtr;
 
     // Guarantee that the first lookup will fetch the context by setting MAX_VALUE
     private int prevChunkX = Integer.MAX_VALUE;

@@ -119,7 +119,6 @@ public final class NetherPathfinderContext implements IElytraPathFinder {
     private final ResourceKey<Level> dimension;
     private final int nativeDim;
     final int minY;
-    private final BlockStateOctreeInterface boi;
 
     public NetherPathfinderContext(long seed, Path cache, Level world) {
         this.dimension = world.dimension();
@@ -134,7 +133,6 @@ public final class NetherPathfinderContext implements IElytraPathFinder {
         this.nativeDim = dim;
         this.context = NetherPathfinder.newContext(seed, cache != null ? cache.toString() : null, dim, height, Baritone.settings().elytraCustomAllocator.value);
         this.seed = seed;
-        this.boi = new BlockStateOctreeInterface(this);
     }
 
     public boolean hasChunk(ChunkPos pos) {
@@ -159,7 +157,6 @@ public final class NetherPathfinderContext implements IElytraPathFinder {
         this.executeWrite(() -> {
             writeLock.lock();
             try {
-                this.boi.chunkPtr = 0L;
                 NetherPathfinder.cullFarChunks(this.context, chunkX, chunkZ, maxDistanceBlocks);
             } finally {
                 writeLock.unlock();
@@ -175,8 +172,7 @@ public final class NetherPathfinderContext implements IElytraPathFinder {
      * Packs the chunk's blocks into this context's cache on the context's executor.
      *
      * @param resetFirst Kept for callers that ask for a wipe. Packing always allocates a fresh all-air chunk and
-     *                   swaps it into the cache, which frees the old one (and clears this context's own
-     *                   {@link BlockStateOctreeInterface} pointer), so a masked chunk always turns back into real
+     *                   swaps it into the cache, which frees the old one, so a masked chunk always turns back into real
      *                   terrain and the flag changes nothing.
      */
     public void queueForPacking(final LevelChunk chunkIn, final boolean resetFirst) {
@@ -188,8 +184,6 @@ public final class NetherPathfinderContext implements IElytraPathFinder {
             if (chunk != null) {
                 writeLock.lock();
                 try {
-                    // we might free this chunk
-                    this.boi.chunkPtr = 0L;
                     long ptr = NetherPathfinder.allocateAndInsertChunk(this.context, chunk.getPos().x, chunk.getPos().z);
                     writeChunkData(chunk, ptr);
                 } finally {
@@ -209,7 +203,6 @@ public final class NetherPathfinderContext implements IElytraPathFinder {
         this.executeWrite(() -> {
             writeLock.lock();
             try {
-                this.boi.chunkPtr = 0L;
                 NetherPathfinder.insertChunkData(this.context, chunkX, chunkZ, this.nativeDim == NetherPathfinder.DIMENSION_OVERWORLD ? ALL_SOLID_OVERWORLD : ALL_SOLID_OTHER);
             } finally {
                 writeLock.unlock();
@@ -226,7 +219,6 @@ public final class NetherPathfinderContext implements IElytraPathFinder {
         this.executeWrite(() -> {
             writeLock.lock();
             try {
-                this.boi.chunkPtr = 0L;
                 NetherPathfinder.insertChunkData(this.context, chunkX, chunkZ, this.nativeDim == NetherPathfinder.DIMENSION_OVERWORLD ? ALL_AIR_OVERWORLD : ALL_AIR_OTHER);
             } finally {
                 writeLock.unlock();
@@ -433,8 +425,8 @@ public final class NetherPathfinderContext implements IElytraPathFinder {
         }
     }
 
-    public boolean passable(int x, int y, int z) {
-        return !this.boi.get0(x, y, z);
+    public BlockStateOctreeInterface getBoi() {
+        return new BlockStateOctreeInterface(this);
     }
 
     public void cancel() {
