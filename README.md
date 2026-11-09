@@ -3,10 +3,10 @@
 Fork of Baritone for **Minecraft 1.21.11 only** (`v1.3.0-1.21.11`, Mojang mappings), with the elytra changes the
 [HunterBuddy](https://github.com/Likon69/HunterBuddy) Meteor addon needs for long nether flights on 2b2t.
 From hb52 it also carries upstream Baritone's elytra flight in the Overworld and the End, merged on nether-pathfinder 1.6, with the upstream movement, rendering and settings changes that came with that
-merge. The fork's own changes are in the elytra code, plus four small hooks outside it (items 12, 16, 30 and 32).
+merge. The fork's own changes are in the elytra code, plus five small hooks outside it (items 12, 16, 30, 32 and 35).
 
 - Build: `./gradlew :fabric:build -Pmod_version=1.3.0-hbN-1.21.11`, output in
-  `dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb52**.
+  `dist/baritone-api-fabric-1.3.0-hbN-1.21.11.jar`. Current version: **hb53**.
 - Logs: `#elytraChatSpam true` and `#chatDebug true`.
 - Patched native pathfinder: [Likon69/nether-pathfinder](https://github.com/Likon69/nether-pathfinder).
 
@@ -44,6 +44,12 @@ merge. The fork's own changes are in the elytra code, plus four small hooks outs
 30. A pillar that would jump into a solid block three up breaks it first, instead of jumping into it and failing over and over.
 31. When launch, climb and relocate have all failed, the ladder tries digging three blocks straight up before giving up on the takeoff entirely.
 32. A movement that runs past its expected time logs what it was standing in, what was above it, whether it was on the ground, and what was in hand.
+33. Every reader of the nether-pathfinder cache is its own, used inside one hold of the read lock, so no thread reads a chunk pointer another thread cached or a write freed, and the solver reads a copy of the loaded chunks (ported from ZacSharp's upstream PR #5155 for 0Mattias's issue #5136).
+34. A turn held from an earlier solution is simulated with the current tick's context, never with a reader from an earlier lock hold.
+35. `ToolSet` copies the hotbar stacks when a path calculation starts, so the pathing thread never reads stacks the game is changing.
+36. Landing within 16 blocks of the destination ends the flight instead of starting the takeoff ladder again, and the landing search is announced once.
+37. When no landing spot passes the strict search under a ceiling, a relaxed pass accepts 3 blocks of air without the 9x9x9 bubble. When that fails too it sets down in place, or over lava lands on the nearest safe ground within 64 blocks, or flies on 96 blocks when there is none, instead of circling.
+38. The ledge takeoff pauses before it asks for its flight path, so a path that is ready at once no longer leaves it standing at the edge.
 
 Items 3, 5 and 10 act in the search that runs on the plain native context: the Nether by default, and the Overworld and
 End only with upstream's `elytraAllowAboveBuildLimit` off. With it on (its default), Overworld and End searches go
